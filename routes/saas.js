@@ -1802,12 +1802,14 @@ router.get(
         .select("name ownerName email phone status createdAt")
         .lean(),
       BillingTransaction.aggregate([
-        { $match: { status: "success", createdAt: { $gte: trendStart } } },
+        { $match: { status: "success" } },
+        { $addFields: { trendDate: { $ifNull: ["$paidAt", "$createdAt"] } } },
+        { $match: { trendDate: { $gte: trendStart } } },
         {
           $group: {
             _id: {
-              year: { $year: "$createdAt" },
-              month: { $month: "$createdAt" },
+              year: { $year: "$trendDate" },
+              month: { $month: "$trendDate" },
             },
             amount: { $sum: "$amount" },
             count: { $sum: 1 },
