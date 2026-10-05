@@ -1105,6 +1105,18 @@ const updateFormById = async (req, res) => {
 
     const existing = await Form.findById(id);
     if (!ensureScopedDocument(req, existing, res, "Form not found")) return;
+
+    if (update.joiningDate !== undefined) {
+      const previousDate = new Date(existing.joiningDate);
+      const nextDate = new Date(update.joiningDate);
+      const previousDay = Number.isNaN(previousDate.getTime()) ? "" : previousDate.toISOString().slice(0, 10);
+      const nextDay = Number.isNaN(nextDate.getTime()) ? "" : nextDate.toISOString().slice(0, 10);
+      const joiningDateChanged = Boolean(nextDay && previousDay && nextDay !== previousDay);
+      if (joiningDateChanged && existing.joiningDateChangeUsed) {
+        return res.status(400).json({ message: "Joining date can only be changed once." });
+      }
+      if (joiningDateChanged) update.joiningDateChangeUsed = true;
+    }
     update.propertyType = propertyTypeFromTenantData({ ...existing.toObject(), ...update });
     update.intakeStatus = normalizeIntakeStatus(update.intakeStatus || existing.intakeStatus);
 

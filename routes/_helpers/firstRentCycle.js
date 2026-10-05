@@ -123,7 +123,15 @@ function normalizeFirstRentCycle(existing = {}, incoming = {}) {
 
   if (!cycleTouched) return {};
 
-  if (!isFirstRentCycleEditable(existing)) {
+  const existingMonth = deriveFirstRentMonth(existing.joiningDate, existing.firstRentStatus);
+  const requestedMonth = Object.prototype.hasOwnProperty.call(incoming, "joiningDate")
+    ? deriveFirstRentMonth(incoming.joiningDate, incoming.firstRentStatus || existing.firstRentStatus)
+    : existingMonth;
+  const joiningMonthChanged = Boolean(requestedMonth && requestedMonth !== existingMonth);
+
+  // A deliberate joining-date correction must also correct the advance-payment
+  // month, even after the original first-cycle editing window has elapsed.
+  if (!isFirstRentCycleEditable(existing) && !joiningMonthChanged) {
     return {
       firstRentStatus: existing.firstRentStatus || "NOT_PAID",
       firstRentMonth:

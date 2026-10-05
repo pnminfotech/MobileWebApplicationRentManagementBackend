@@ -423,6 +423,7 @@ router.get("/form/:id/rent-due", async (req, res) => {
       dueMonths,
     });
   } catch (error) {
+    console.error("[rent-due] calculation failed", { tenantId: req.params.id, error: error?.stack || error?.message || error });
     res.status(500).json({ message: "Unable to calculate tenant rent due", error: error.message });
   }
 });

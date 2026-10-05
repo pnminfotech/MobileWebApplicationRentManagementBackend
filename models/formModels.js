@@ -96,6 +96,7 @@ const formSchema = new mongoose.Schema(
 
     name: { type: String, required: true },
     joiningDate: { type: Date, required: true },
+    joiningDateChangeUsed: { type: Boolean, default: false },
     propertyType: {
       type: String,
       enum: ["bed", "room", "shop"],

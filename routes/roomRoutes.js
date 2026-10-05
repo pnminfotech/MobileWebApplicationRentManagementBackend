@@ -816,7 +816,7 @@ router.post("/:roomId/bed/from-placeholder", async (req, res) => {
 
 router.put("/:roomId/bed/:bedNo", async (req, res) => {
   const { roomId, bedNo } = req.params;
-  const { price, bedCategory } = req.body || {};
+  const { price, bedCategory, newBedNo } = req.body || {};
 
   try {
     const room = await Room.findById(roomId);
@@ -828,6 +828,14 @@ router.put("/:roomId/bed/:bedNo", async (req, res) => {
         String(bedNo).trim().toLowerCase()
     );
     if (!bed) return res.status(404).json({ message: "Bed not found" });
+
+    if (newBedNo !== undefined) {
+      const nextBedNo = String(newBedNo).trim();
+      if (!nextBedNo) return res.status(400).json({ message: "Bed number is required" });
+      const duplicate = room.beds.some((item) => item !== bed && String(item.bedNo).trim().toLowerCase() === nextBedNo.toLowerCase());
+      if (duplicate) return res.status(400).json({ message: "A bed with this number already exists in this room" });
+      bed.bedNo = nextBedNo;
+    }
 
     // ✅ Update price (allow clearing)
     if (price !== undefined) {
