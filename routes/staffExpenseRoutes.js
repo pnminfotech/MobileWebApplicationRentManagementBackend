@@ -4,6 +4,7 @@ const authAdmin = require("../middleware/adminAuth");
 const { attachSystemAuthIfPresent } = require("../middleware/saasAuth");
 const { scopedQuery, scopedCreate, scopedUpdate } = require("../utils/organizationScope");
 const { actorName, diffRecords, writeAuditLog } = require("../utils/auditLogger");
+const { requireSystemSecurityPin } = require("../middleware/securityPin");
 
 const router = express.Router();
 
@@ -135,7 +136,7 @@ router.put("/:id", async (req, res) => {
 });
 
 // DELETE
-router.delete("/:id", async (req, res) => {
+router.delete("/:id", requireSystemSecurityPin, async (req, res) => {
   try {
     const deleted = await StaffExpense.findOneAndDelete(scopedQuery(req, { _id: req.params.id }));
     if (!deleted) return res.status(404).json({ message: "Expense not found" });

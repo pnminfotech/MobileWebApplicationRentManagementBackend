@@ -143,7 +143,7 @@ async function applyPaidSubscriptionUpgrade(transaction, payload = {}) {
     notifyOrganization(organization._id, {
       type: "payment_confirmation",
       title: "Package upgraded",
-      message: `Payment received. New package: ${newUnits.beds} beds, ${newUnits.rooms} rooms, ${newUnits.shops} shops.`,
+      message: `Your upgrade payment was successful. Your new package includes ${newUnits.beds} beds, ${newUnits.rooms} rooms, and ${newUnits.shops} shops.`,
       priority: "high",
       entityType: "payment",
       entityId: transaction._id,
@@ -266,7 +266,7 @@ async function activatePaidSubscription(transaction, payload = {}) {
     notifyOrganization(subscription.organizationId, {
       type: "payment_confirmation",
       title: previousSubscription ? "Subscription renewed" : "Subscription activated",
-      message: `Payment of ${transaction.amount} ${transaction.currency || "INR"} received. Subscription is active until ${subscription.endDate.toLocaleDateString("en-IN")}.`,
+      message: `Your payment of ${transaction.amount} ${transaction.currency || "INR"} was successful. Your subscription is active until ${subscription.endDate.toLocaleDateString("en-IN")}.`,
       priority: "high",
       entityType: "subscription",
       entityId: subscription._id,

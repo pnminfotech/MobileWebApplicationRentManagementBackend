@@ -195,6 +195,7 @@ const Form = require("../models/Form");
 const authAdmin = require("../middleware/adminAuth");
 const { attachSystemAuthIfPresent } = require("../middleware/saasAuth");
 const { assertUnitCapacity, getUnitQuota } = require("../services/unitQuota");
+const { requireSystemSecurityPin } = require("../middleware/securityPin");
 const {
   scopedQuery,
   scopedCreate,
@@ -862,7 +863,7 @@ router.put("/:roomId/bed/:bedNo", async (req, res) => {
 });
 
 // ✅ Delete bed by roomId
-router.delete("/:roomId/bed/:bedNo", async (req, res) => {
+router.delete("/:roomId/bed/:bedNo", requireSystemSecurityPin, async (req, res) => {
   const { roomId, bedNo } = req.params;
 
   try {
@@ -922,7 +923,7 @@ router.delete("/:roomId/bed/:bedNo", async (req, res) => {
   }
 });
 
-router.delete("/:roomId", async (req, res) => {
+router.delete("/:roomId", requireSystemSecurityPin, async (req, res) => {
   const { roomId } = req.params;
 
   try {
@@ -1037,6 +1038,23 @@ router.put("/:roomId", async (req, res) => {
       isPlaceholder: { $ne: true },
     })).collation({ locale: "en", strength: 2 });
     if (duplicateUnit) {
+      // Hostel beds are individual purchased units, but multiple beds belong in
+      // one physical room. When a pending bed is given an existing room number,
+      // merge it into that room instead of rejecting the room number.
+      if (nextLocation.propertyType === "bed") {
+        const incomingBeds = Array.isArray(currentRoom.beds) ? currentRoom.beds : [];
+        const existingBedNos = new Set((duplicateUnit.beds || []).map((bed) => String(bed.bedNo || "").trim().toLowerCase()));
+        const conflictingBed = incomingBeds.find((bed) => existingBedNos.has(String(bed.bedNo || "").trim().toLowerCase()));
+        if (conflictingBed) {
+          return res.status(400).json({ message: `Bed ${conflictingBed.bedNo} already exists in room ${nextLocation.roomNo}.` });
+        }
+        duplicateUnit.beds = [...(duplicateUnit.beds || []), ...incomingBeds];
+        if (update.meterNo) duplicateUnit.meterNo = update.meterNo;
+        if (update.lastMeterReading !== undefined) duplicateUnit.lastMeterReading = update.lastMeterReading;
+        await duplicateUnit.save();
+        await Room.deleteOne(scopedQuery(req, { _id: currentRoom._id }));
+        return res.json(duplicateUnit);
+      }
       return res.status(400).json({ message: "Unit already exists in this location" });
     }
 

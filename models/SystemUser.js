@@ -14,6 +14,8 @@ const systemUserSchema = new mongoose.Schema(
     email: { type: String, required: true, trim: true, lowercase: true, unique: true },
     phone: { type: String, trim: true, default: "" },
     password: { type: String, required: true, select: false },
+    // Separate short PIN used only to confirm high-risk Super Admin actions.
+    securityPin: { type: String, select: false, default: null },
     role: {
       type: String,
       enum: ["superadmin", "system_admin"],
@@ -39,6 +41,11 @@ systemUserSchema.pre("save", async function hashPassword(next) {
 
 systemUserSchema.methods.comparePassword = function comparePassword(candidate) {
   return bcrypt.compare(candidate, this.password);
+};
+
+systemUserSchema.methods.compareSecurityPin = function compareSecurityPin(candidate) {
+  if (!this.securityPin) return Promise.resolve(false);
+  return bcrypt.compare(String(candidate || ""), this.securityPin);
 };
 
 module.exports =

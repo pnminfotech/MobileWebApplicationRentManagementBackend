@@ -13,6 +13,9 @@ router.use(authAdmin);
 
 router.use((req, res, next) => {
   if (req.systemUser?.role === "superadmin") return next();
+  // During first-time registration, meal settings must be stored before the
+  // onboarding request turns the canteen feature on for the organization.
+  if (req.method === "PUT" && req.path === "/settings") return next();
   if (!req.organization?.features?.canteenEnabled) {
     return res.status(403).json({ message: "Canteen feature is not enabled for this organization" });
   }

@@ -1,5 +1,6 @@
 const express = require("express");
 const crypto = require("crypto");
+const bcrypt = require("bcryptjs");
 
 const Organization = require("../models/Organization");
 const SystemUser = require("../models/SystemUser");
@@ -23,6 +24,7 @@ const Attendance = require("../models/Attendance");
 const Notification = require("../models/Notification");
 const Archive = require("../models/archiveSchema");
 const DuplicateForm = require("../models/DuplicateForm");
+const AuditLog = require("../models/AuditLog");
 const {
   signSystemToken,
   requireSystemAuth,
@@ -84,6 +86,24 @@ function publicUser(user) {
     status: user.status,
     organizationId: user.organizationId ? String(user.organizationId) : null,
   };
+}
+
+async function verifySuperadminSecurityPin(req, res) {
+  const pin = String(req.body?.securityPin || "").trim();
+  if (!/^\d{4,8}$/.test(pin)) {
+    res.status(400).json({ message: "Enter your 4 to 8 digit security PIN." });
+    return false;
+  }
+  const user = await SystemUser.findById(req.systemUser._id).select("+securityPin");
+  if (!user?.securityPin) {
+    res.status(428).json({ message: "Set up your security PIN before performing this action." });
+    return false;
+  }
+  if (!(await user.compareSecurityPin(pin))) {
+    res.status(403).json({ message: "Incorrect security PIN." });
+    return false;
+  }
+  return true;
 }
 
 function hashResetToken(token) {
@@ -944,6 +964,37 @@ router.post(
         return res.status(400).json({ message: "Active subscription required for package upgrade" });
       }
 
+      // Handle trials before checking for any old payment attempt. A previous
+      // unfinished checkout must never turn a later trial unit addition into a
+      // paid upgrade.
+      if (isTrialSubscription(currentSubscription)) {
+        const trialAddedUnits = normalizeUnits(req.body?.units || req.body?.addUnits || {});
+        if (!hasAnyUnit(trialAddedUnits)) {
+          return res.status(400).json({ message: "Add at least one bed, room, or shop" });
+        }
+        const trialCurrentUnits = normalizeUnits(currentSubscription.units || req.organization.unitAllocation || {});
+        const trialNewUnits = normalizeUnits(addUnits(trialCurrentUnits, trialAddedUnits));
+        await BillingTransaction.updateMany(
+          {
+            organizationId: req.organizationId,
+            status: { $in: ["created", "pending"] },
+            "requestPayload.action": "subscription_upgrade",
+          },
+          { $set: { status: "cancelled" } }
+        );
+        currentSubscription.units = trialNewUnits;
+        await currentSubscription.save();
+        req.organization.unitAllocation = trialNewUnits;
+        await req.organization.save();
+        await ensureReservedUnits(req.organizationId, trialNewUnits);
+        return res.json({
+          message: "Trial units added. Payment will be calculated when the trial ends.",
+          subscription: currentSubscription,
+          trialUpgrade: true,
+          upgrade: { currentUnits: trialCurrentUnits, addedUnits: trialAddedUnits, newUnits: trialNewUnits, amount: 0, currency: "INR" },
+        });
+      }
+
       const pendingExisting = await BillingTransaction.findOne({
         organizationId: req.organizationId,
         status: { $in: ["created", "pending"] },
@@ -978,6 +1029,7 @@ router.post(
 
       const currentUnits = normalizeUnits(currentSubscription.units || req.organization.unitAllocation || {});
       const newUnits = normalizeUnits(addUnits(currentUnits, addedUnits));
+
       const plan = await findUpgradePricingPlan(currentSubscription);
 
       if (!plan) {
@@ -1212,6 +1264,63 @@ router.post("/referrals/quote", async (req, res) => {
   }
 });
 
+router.get("/security/pin-status", requireSystemAuth, async (req, res) => {
+  const user = await SystemUser.findById(req.systemUser._id).select("+securityPin");
+  res.json({ configured: Boolean(user?.securityPin) });
+});
+
+router.post("/security/pin", requireSystemAuth, async (req, res) => {
+  const pin = String(req.body?.pin || "").trim();
+  const currentPin = String(req.body?.currentPin || "").trim();
+  if (!/^\d{4,8}$/.test(pin)) return res.status(400).json({ message: "PIN must contain 4 to 8 digits." });
+  const user = await SystemUser.findById(req.systemUser._id).select("+securityPin");
+  if (!user) return res.status(404).json({ message: "User not found" });
+  if (user.securityPin && !(await user.compareSecurityPin(currentPin))) return res.status(403).json({ message: "Current security PIN is incorrect." });
+  user.securityPin = await bcrypt.hash(pin, 10);
+  await user.save();
+  res.json({ configured: true });
+});
+
+router.post("/security/pin/reset", requireSystemAuth, async (req, res) => {
+  const pin = String(req.body?.pin || "").trim();
+  if (!/^\d{4,8}$/.test(pin)) return res.status(400).json({ message: "PIN must contain 4 to 8 digits." });
+  const user = await SystemUser.findById(req.systemUser._id).select("+password +securityPin");
+  if (!user || !(await user.comparePassword(String(req.body?.password || "")))) return res.status(403).json({ message: "Your account password is incorrect." });
+  user.securityPin = await bcrypt.hash(pin, 10);
+  await user.save();
+  res.json({ configured: true });
+});
+
+router.get("/admin/security/pin-status", requireSystemAuth, requireRole("superadmin"), async (req, res) => {
+  const user = await SystemUser.findById(req.systemUser._id).select("+securityPin");
+  res.json({ configured: Boolean(user?.securityPin) });
+});
+
+router.post("/admin/security/pin", requireSystemAuth, requireRole("superadmin"), async (req, res) => {
+  const pin = String(req.body?.pin || "").trim();
+  const currentPin = String(req.body?.currentPin || "").trim();
+  if (!/^\d{4,8}$/.test(pin)) return res.status(400).json({ message: "PIN must contain 4 to 8 digits." });
+  const user = await SystemUser.findById(req.systemUser._id).select("+securityPin");
+  if (!user) return res.status(404).json({ message: "User not found" });
+  if (user.securityPin && !(await user.compareSecurityPin(currentPin))) {
+    return res.status(403).json({ message: "Current security PIN is incorrect." });
+  }
+  user.securityPin = await bcrypt.hash(pin, 10);
+  await user.save();
+  res.json({ configured: true, message: "Security PIN saved." });
+});
+
+router.post("/admin/security/pin/reset", requireSystemAuth, requireRole("superadmin"), async (req, res) => {
+  const pin = String(req.body?.pin || "").trim();
+  const password = String(req.body?.password || "");
+  if (!/^\d{4,8}$/.test(pin)) return res.status(400).json({ message: "PIN must contain 4 to 8 digits." });
+  const user = await SystemUser.findById(req.systemUser._id).select("+password +securityPin");
+  if (!user || !(await user.comparePassword(password))) return res.status(403).json({ message: "Your account password is incorrect." });
+  user.securityPin = await bcrypt.hash(pin, 10);
+  await user.save();
+  res.json({ configured: true, message: "Security PIN reset." });
+});
+
 router.get(
   "/admin/referrals",
   requireSystemAuth,
@@ -1270,6 +1379,7 @@ router.delete(
   requireRole("superadmin"),
   async (req, res) => {
     try {
+      if (!(await verifySuperadminSecurityPin(req, res))) return;
       const referral = await ReferralCode.findByIdAndDelete(req.params.id);
       if (!referral) return res.status(404).json({ message: "Referral code not found" });
       res.json({ message: "Referral code deleted successfully", deleted: true, referral });
@@ -1312,11 +1422,103 @@ router.get(
   }
 );
 
+router.get(
+  "/admin/organizations/:id/vacant-units",
+  requireSystemAuth,
+  requireRole("superadmin"),
+  async (req, res) => {
+    try {
+      const organization = await Organization.findById(req.params.id).lean();
+      if (!organization) return res.status(404).json({ message: "Organization not found" });
+
+      const [rooms, activeTenants] = await Promise.all([
+        Room.find({ organizationId: organization._id }).lean(),
+        Form.find({ organizationId: organization._id, leaveDate: { $in: [null, ""] } }).lean(),
+      ]);
+      const roomHasTenant = (room) => activeTenants.some((tenant) => String(tenant.roomId || "") === String(room._id));
+      const supportUnitName = (room) => {
+        const name = String(room.category || "").trim();
+        return room.isPlaceholder || !name || /^unassigned$/i.test(name) ? "Unit" : name;
+      };
+      const rows = [];
+      rooms.forEach((room) => {
+        if (room.propertyType === "bed") {
+          (room.beds || []).forEach((bed) => {
+            const occupied = activeTenants.some((tenant) => String(tenant.roomId || "") === String(room._id) && String(tenant.bedNo || "").trim().toLowerCase() === String(bed.bedNo || "").trim().toLowerCase());
+            if (!occupied) rows.push({ id: `${room._id}:bed:${bed.bedNo}`, unitId: String(room._id), kind: "bed", propertyType: "bed", bedNo: bed.bedNo, label: `${supportUnitName(room)} | ${room.isPlaceholder ? "Details pending" : room.roomNo || "Room"} | Bed ${bed.bedNo}`, isPlaceholder: Boolean(room.isPlaceholder) });
+          });
+          return;
+        }
+        if (!roomHasTenant(room)) rows.push({ id: `${room._id}:unit`, unitId: String(room._id), kind: "unit", propertyType: room.propertyType, label: `${supportUnitName(room)} | ${room.isPlaceholder ? "Details pending" : room.roomNo || "Unit"}`, isPlaceholder: Boolean(room.isPlaceholder) });
+      });
+      res.json(rows);
+    } catch (err) {
+      res.status(500).json({ message: "Unable to load vacant units", error: err.message });
+    }
+  }
+);
+
+router.delete(
+  "/admin/organizations/:id/vacant-units/:unitId",
+  requireSystemAuth,
+  requireRole("superadmin"),
+  async (req, res) => {
+    try {
+      if (!(await verifySuperadminSecurityPin(req, res))) return;
+      const organization = await Organization.findById(req.params.id);
+      if (!organization) return res.status(404).json({ message: "Organization not found" });
+      const room = await Room.findOne({ _id: req.params.unitId, organizationId: organization._id });
+      if (!room) return res.status(404).json({ message: "Unit not found" });
+
+      const reason = String(req.body?.reason || "Customer requested a unit reduction").trim().slice(0, 300);
+      const activeTenants = await Form.find({ organizationId: organization._id, leaveDate: { $in: [null, ""] } }).lean();
+      const hasTenant = (bedNo) => activeTenants.some((tenant) => String(tenant.roomId || "") === String(room._id) && (!bedNo || String(tenant.bedNo || "").trim().toLowerCase() === String(bedNo).trim().toLowerCase()));
+      const kind = String(req.body?.kind || "");
+      const bedNo = String(req.body?.bedNo || "").trim();
+      let removed = null;
+      let decrement = { beds: 0, rooms: 0, shops: 0 };
+
+      if (kind === "bed") {
+        if (room.propertyType !== "bed" || !bedNo) return res.status(400).json({ message: "Select a hostel bed to remove" });
+        const bed = (room.beds || []).find((item) => String(item.bedNo || "").trim().toLowerCase() === bedNo.toLowerCase());
+        if (!bed) return res.status(404).json({ message: "Bed not found" });
+        if (hasTenant(bedNo)) return res.status(400).json({ message: "This bed cannot be removed because it has an active tenant" });
+        room.beds = (room.beds || []).filter((item) => String(item.bedNo || "").trim().toLowerCase() !== bedNo.toLowerCase());
+        await room.save();
+        removed = { type: "bed", bedNo, roomNo: room.roomNo };
+        decrement.beds = 1;
+      } else {
+        if (room.propertyType === "bed") return res.status(400).json({ message: "Remove hostel beds individually" });
+        if (hasTenant()) return res.status(400).json({ message: "This unit cannot be removed because it has an active tenant" });
+        await Room.deleteOne({ _id: room._id });
+        removed = { type: room.propertyType, roomNo: room.roomNo };
+        decrement[room.propertyType === "shop" ? "shops" : "rooms"] = 1;
+      }
+
+      const latestSubscription = await Subscription.findOne({ organizationId: organization._id }).sort({ createdAt: -1 });
+      const currentUnits = normalizeUnits(latestSubscription?.units || organization.unitAllocation || {});
+      const newUnits = normalizeUnits({ beds: currentUnits.beds - decrement.beds, rooms: currentUnits.rooms - decrement.rooms, shops: currentUnits.shops - decrement.shops });
+      organization.unitAllocation = newUnits;
+      await organization.save();
+      if (latestSubscription) {
+        latestSubscription.units = newUnits;
+        await latestSubscription.save();
+      }
+      await AuditLog.create({ organizationId: organization._id, entityType: "unit", entityId: room._id, action: "delete", actorId: String(req.systemUser._id), actorName: req.systemUser.name || "Superadmin", actorEmail: req.systemUser.email || "", actorRole: "superadmin", reason, before: { propertyType: room.propertyType, roomNo: room.roomNo, bedNo: bedNo || null }, after: { units: newUnits }, changes: { removed, decrement } });
+      await notifyOrganization(organization._id, { type: "system", title: "Unit count updated", message: "A vacant unit was removed by support. Your subscription amount will reflect the updated unit count.", priority: "normal", entityType: "organization", entityId: organization._id, actionType: "unit_reduction", payload: { removed, units: newUnits, reason } });
+      res.json({ message: "Vacant unit removed and subscription count updated", units: newUnits, removed });
+    } catch (err) {
+      res.status(500).json({ message: "Unable to remove unit", error: err.message });
+    }
+  }
+);
+
 router.patch(
   "/admin/organizations/:id/status",
   requireSystemAuth,
   requireRole("superadmin"),
   async (req, res) => {
+    if (!(await verifySuperadminSecurityPin(req, res))) return;
     const status = String(req.body?.status || "");
     const allowed = new Set(["pending_payment", "active", "suspended", "expired", "cancelled"]);
     if (!allowed.has(status)) {
@@ -1354,6 +1556,7 @@ router.post(
   requireSystemAuth,
   requireRole("superadmin"),
   async (req, res) => {
+    if (!(await verifySuperadminSecurityPin(req, res))) return;
     const subscription = await Subscription.findById(req.params.id);
     if (!subscription) return res.status(404).json({ message: "Subscription not found" });
 
@@ -1403,224 +1606,6 @@ router.post(
     });
 
     res.json(subscription);
-  }
-);
-
-router.post(
-  "/admin/organizations/:id/renew",
-  requireSystemAuth,
-  requireRole("superadmin"),
-  async (req, res) => {
-    try {
-      const organization = await Organization.findById(req.params.id);
-      if (!organization) return res.status(404).json({ message: "Organization not found" });
-
-      const currentSubscription = await Subscription.findOne({ organizationId: organization._id })
-        .sort({ createdAt: -1 })
-        .populate("planId");
-
-      let plan = null;
-      if (req.body?.planId) {
-        plan = await SubscriptionPlan.findOne({ _id: req.body.planId, isActive: true });
-        if (!plan) return res.status(404).json({ message: "Plan not found" });
-      } else {
-        const durationMonths = getDurationMonths(req.body);
-        plan = await SubscriptionPlan.findOne({ durationMonths, isActive: true }).sort({ createdAt: -1 });
-      }
-
-      const units = normalizeUnits(
-        req.body?.units ||
-          currentSubscription?.units ||
-          organization.unitAllocation ||
-          {}
-      );
-      const durationMonths = plan?.durationMonths || getDurationMonths(req.body);
-      const startDate = renewalStartDate(currentSubscription, req.body?.startDate);
-      const endDate = addMonths(startDate, durationMonths);
-      const originalAmount = req.body?.amount !== undefined
-        ? Math.max(0, Number(req.body.amount || 0))
-        : plan
-          ? calculateSubscriptionAmount(plan, units)
-          : Number(currentSubscription?.amount || 0);
-      const walletPricing = await applyWalletPricing(organization._id, originalAmount, req.body?.useWallet === true);
-      const amount = walletPricing.payableAmount;
-      const currency = plan?.currency || currentSubscription?.currency || "INR";
-
-      if (currentSubscription && currentSubscription.status === "active") {
-        currentSubscription.status = isPastDate(currentSubscription.endDate) ? "expired" : "cancelled";
-        await currentSubscription.save();
-      }
-
-      const subscription = await Subscription.create({
-        organizationId: organization._id,
-        planId: plan?._id || currentSubscription?.planId?._id || currentSubscription?.planId || undefined,
-        status: "active",
-        startDate,
-        endDate,
-        durationMonths,
-        units,
-        amount,
-        pricing: {
-          subtotal: originalAmount,
-          payableAmount: amount,
-          ...walletPricing,
-        },
-        currency,
-      });
-
-      const transaction = await BillingTransaction.create({
-        organizationId: organization._id,
-        subscriptionId: subscription._id,
-        merchantTransactionId: `REN${Date.now()}${crypto.randomInt(1000, 9999)}`,
-        provider: req.body?.provider || "manual",
-        amount,
-        currency,
-        status: "success",
-        paidAt: new Date(),
-        responsePayload: {
-          action: "renewal",
-          renewedBy: String(req.systemUser._id),
-          previousSubscriptionId: currentSubscription?._id ? String(currentSubscription._id) : null,
-          originalAmount,
-          useWallet: req.body?.useWallet === true,
-        },
-      });
-      await debitWalletUsageFromTransaction(transaction, "renewal_discount_used");
-
-      subscription.latestTransactionId = transaction._id;
-      await subscription.save();
-
-      organization.status = "active";
-      organization.activatedAt = organization.activatedAt || startDate;
-      organization.unitAllocation = units;
-      await organization.save();
-
-      await SystemUser.updateMany(
-        { organizationId: organization._id },
-        { $set: { status: "active" } }
-      );
-
-      await Promise.allSettled([
-        resolveSubscriptionNotifications(currentSubscription, organization._id),
-        resolveSubscriptionNotifications(subscription, organization._id),
-      ]);
-
-      await notifyOrganization(organization._id, {
-        type: "payment_confirmation",
-        title: "Subscription renewed",
-        message: `Your subscription has been renewed until ${endDate.toLocaleDateString("en-IN")}.`,
-        priority: "high",
-        entityType: "subscription",
-        entityId: subscription._id,
-        actionType: "subscription_payment_success",
-        expiresAt: addDays(new Date(), 7),
-        payload: {
-          subscriptionId: String(subscription._id),
-          transactionId: String(transaction._id),
-          startDate,
-          endDate,
-          amount,
-          currency,
-        },
-      });
-
-      res.status(201).json({ organization, subscription, transaction });
-    } catch (err) {
-      console.error("renew subscription error:", err);
-      res.status(500).json({ message: "Server error" });
-    }
-  }
-);
-
-router.post(
-  "/admin/organizations/:id/upgrade/approve",
-  requireSystemAuth,
-  requireRole("superadmin"),
-  async (req, res) => {
-    try {
-      const organization = await Organization.findById(req.params.id);
-      if (!organization) return res.status(404).json({ message: "Organization not found" });
-
-      const query = {
-        organizationId: organization._id,
-        status: { $in: ["created", "pending"] },
-        "requestPayload.action": "subscription_upgrade",
-      };
-      if (req.body?.transactionId) query._id = req.body.transactionId;
-
-      const transaction = await BillingTransaction.findOne(query).sort({ createdAt: -1 });
-      if (!transaction) return res.status(404).json({ message: "Pending upgrade request not found" });
-
-      const subscription = await Subscription.findById(transaction.subscriptionId);
-      if (!subscription) return res.status(404).json({ message: "Subscription not found" });
-
-      const payload = transaction.requestPayload || {};
-      const currentUnits = normalizeUnits(subscription.units || organization.unitAllocation || {});
-      const addedUnits = normalizeUnits(payload.addedUnits || {});
-      const newUnits = normalizeUnits(payload.newUnits || addUnits(currentUnits, addedUnits));
-
-      subscription.units = newUnits;
-      subscription.amount = Number(subscription.amount || 0) + Number(transaction.amount || 0);
-      subscription.latestTransactionId = transaction._id;
-      await subscription.save();
-
-      organization.unitAllocation = newUnits;
-      organization.businessType = businessTypeFromUnits(newUnits);
-      if (organization.status !== "active") organization.status = "active";
-      await organization.save();
-
-      transaction.status = "success";
-      transaction.provider = req.body?.provider || transaction.provider || "manual";
-      transaction.paidAt = req.body?.paidAt ? new Date(req.body.paidAt) : new Date();
-      transaction.responsePayload = {
-        ...(transaction.responsePayload || {}),
-        action: "subscription_upgrade_approved",
-        approvedBy: String(req.systemUser._id),
-        currentUnits,
-        addedUnits,
-        newUnits,
-      };
-      await transaction.save();
-      await debitWalletUsageFromTransaction(transaction, "upgrade_discount_used");
-
-      await Promise.allSettled([
-        resolveNotifications({
-          audience: "superadmin",
-          entityType: "organization",
-          entityId: organization._id,
-          actionType: "subscription_upgrade_request",
-        }),
-        resolveNotifications({
-          organizationId: organization._id,
-          entityType: "subscription",
-          entityId: subscription._id,
-          actionType: "subscription_upgrade_payment_required",
-        }),
-        notifyOrganization(organization._id, {
-          type: "payment_confirmation",
-          title: "Package upgraded",
-          message: `Your package has been upgraded. New units: ${newUnits.beds} beds, ${newUnits.rooms} rooms, ${newUnits.shops} shops.`,
-          priority: "high",
-          entityType: "payment",
-          entityId: transaction._id,
-          actionType: "subscription_upgrade_success",
-          expiresAt: addDays(new Date(), 7),
-          payload: {
-            subscriptionId: String(subscription._id),
-            transactionId: String(transaction._id),
-            addedUnits,
-            newUnits,
-            amount: transaction.amount,
-            currency: transaction.currency,
-          },
-        }),
-      ]);
-
-      res.json({ organization, subscription, transaction });
-    } catch (err) {
-      console.error("approve upgrade error:", err);
-      res.status(500).json({ message: "Server error" });
-    }
   }
 );
 
@@ -1725,6 +1710,7 @@ router.delete(
   requireRole("superadmin"),
   async (req, res) => {
     try {
+      if (!(await verifySuperadminSecurityPin(req, res))) return;
       const plan = await SubscriptionPlan.findByIdAndDelete(req.params.id);
       if (!plan) return res.status(404).json({ message: "Plan not found" });
       res.json({ message: "Plan deleted successfully", deleted: true, plan });

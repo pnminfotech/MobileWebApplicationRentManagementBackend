@@ -74,6 +74,7 @@ const authAdmin = require("../middleware/adminAuth");
 const { attachSystemAuthIfPresent } = require("../middleware/saasAuth");
 const { scopedQuery, scopedUpdate } = require("../utils/organizationScope");
 const { actorName, diffRecords, writeAuditLog } = require("../utils/auditLogger");
+const { requireSystemSecurityPin } = require("../middleware/securityPin");
 const { getLightBillCollectionSummary } = require("./_helpers/lightBillBilling");
 
 router.use(attachSystemAuthIfPresent);
@@ -328,7 +329,7 @@ router.put('/:id', async (req, res) => {
 });
 
 // Delete
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireSystemSecurityPin, async (req, res) => {
   try {
     const lightBill = await LightBillEntry.findOneAndDelete(scopedQuery(req, { _id: req.params.id }));
     if (!lightBill) return res.status(404).json({ message: 'Light Bill not found' });

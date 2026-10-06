@@ -6,6 +6,7 @@ const authAdmin = require("../middleware/adminAuth");
 const { attachSystemAuthIfPresent } = require("../middleware/saasAuth");
 const { scopedQuery, scopedUpdate } = require("../utils/organizationScope");
 const { actorName, diffRecords, writeAuditLog } = require("../utils/auditLogger");
+const { requireSystemSecurityPin } = require("../middleware/securityPin");
 router.use(attachSystemAuthIfPresent);
 router.use(authAdmin);
 
@@ -115,7 +116,7 @@ router.put('/:id', async (req, res) => {
 });
 
 // Delete Other Expense
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireSystemSecurityPin, async (req, res) => {
   try {
     const otherExpense = await OtherExpense.findOneAndDelete(scopedQuery(req, { _id: req.params.id }));
     if (!otherExpense) return res.status(404).json({ message: 'Other Expense not found' });
