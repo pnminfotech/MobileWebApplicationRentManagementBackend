@@ -37,7 +37,7 @@ function getImageKit() {
 const MAX_IMAGE_UPLOAD_SIZE = 2 * 1024 * 1024;
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_IMAGE_UPLOAD_SIZE, files: 3 },
+  limits: { fileSize: MAX_IMAGE_UPLOAD_SIZE, files: 10 },
 });
 
 /* ================== Helpers ================== */
@@ -109,23 +109,18 @@ function buildPatch(body) {
   return patch;
 }
 
-function requireInviteOrAdmin(req, res, next) {
-  if (req.body?.inv) return next();
-  return authAdmin(req, res, next);
-}
-
 /* ================== Route ================== */
 router.post(
   "/with-docs",
+  authAdmin,
   upload.fields([
-    { name: "selfAadhar", maxCount: 1 },
-    { name: "parentAadhar", maxCount: 1 },
-    { name: "photo", maxCount: 1 },
+    { name: "documents", maxCount: 10 },
+    { name: "selfAadhar", maxCount: 10 },
+    { name: "parentAadhar", maxCount: 10 },
+    { name: "photo", maxCount: 10 },
   ]),
-  requireInviteOrAdmin,
   async (req, res) => {
     try {
-      console.log("REQ BODY:", req.body);
       const canUseImagekit = hasImageKitConfig();
       const imagekit = canUseImagekit ? getImageKit() : null;
 
@@ -167,14 +162,20 @@ router.post(
       }
 
       // ✅ Upload files to ImageKit and push into documents[]
-      const allFiles = [
-        req.files?.selfAadhar?.[0],
-        req.files?.parentAadhar?.[0],
-        req.files?.photo?.[0],
-      ].filter(Boolean);
-      if (!allFiles.length) {
+      const genericFiles = req.files?.documents || [];
+      const legacyFiles = [
+        ...(req.files?.selfAadhar || []).map((file) => ({ file, relation: "Self Aadhaar Card" })),
+        ...(req.files?.parentAadhar || []).map((file) => ({ file, relation: "Parent Aadhaar Card" })),
+        ...(req.files?.photo || []).map((file) => ({ file, relation: "Tenant Photo" })),
+      ];
+      const rawRelations = req.body?.relations;
+      const relations = Array.isArray(rawRelations) ? rawRelations : rawRelations ? [rawRelations] : [];
+      const genericEntries = genericFiles.map((file, index) => ({ file, relation: String(relations[index] || "Document").trim() || "Document" }));
+      const allEntries = [...genericEntries, ...legacyFiles];
+      const allFiles = allEntries.map((entry) => entry.file);
+      if (!allFiles.length && !req.body?.removeFileIds) {
         return res.status(400).json({
-          message: "No document files were received. Please select the documents again and retry.",
+          message: "Select documents to upload or remove.",
         });
       }
       const invalidFiles = allFiles.filter((file) => !isAllowedImageFile(file));
@@ -237,11 +238,17 @@ router.post(
         });
       }
 
-      await Promise.all([
-        uploadOne(req.files?.selfAadhar?.[0], "Self Aadhaar Card"),
-        uploadOne(req.files?.parentAadhar?.[0], "Parent Aadhaar Card"),
-        uploadOne(req.files?.photo?.[0], "Tenant Photo"),
-      ]);
+      await Promise.all(allEntries.map(({ file, relation }) => uploadOne(file, relation)));
+
+      let removeFileIds = req.body?.removeFileIds || [];
+      if (typeof removeFileIds === "string") {
+        try { removeFileIds = JSON.parse(removeFileIds); } catch { removeFileIds = [removeFileIds]; }
+      }
+      if (!Array.isArray(removeFileIds)) removeFileIds = [];
+      removeFileIds = [...new Set(removeFileIds.map((id) => String(id || "").trim()).filter(Boolean))];
+      if (inv && removeFileIds.length) {
+        return res.status(403).json({ message: "Tenant invite links cannot remove existing documents." });
+      }
 
       let savedForm;
 
@@ -250,15 +257,32 @@ router.post(
         savedForm = await Form.findOne(scopedQuery(req, { _id: formId }));
         if (!savedForm) return res.status(404).json({ message: "Form not found" });
 
-        Object.assign(savedForm, scopedUpdate(req, updateData));
-        if (docsToAdd.length) {
-          const replacedRelations = new Set(docsToAdd.map((document) => document.relation));
-          const retainedDocuments = (savedForm.documents || []).filter(
-            (document) => !replacedRelations.has(document.relation)
-          );
-          savedForm.documents = [...retainedDocuments, ...docsToAdd];
+        const existingDocuments = Array.isArray(savedForm.documents) ? savedForm.documents : [];
+        const documentIdentity = (document) => String(document.fileId || document._id || "");
+        const ownedRemoveIds = new Set(existingDocuments
+          .filter((document) => removeFileIds.includes(documentIdentity(document)))
+          .map(documentIdentity));
+        if (ownedRemoveIds.size !== removeFileIds.length) {
+          return res.status(400).json({ message: "One or more documents to remove were not found for this tenant." });
         }
+
+        Object.assign(savedForm, scopedUpdate(req, updateData));
+        savedForm.documents = [
+          ...existingDocuments.filter((document) => !ownedRemoveIds.has(documentIdentity(document))),
+          ...docsToAdd,
+        ];
         await savedForm.save({ validateModifiedOnly: true });
+
+        const imagekitFileIds = existingDocuments
+          .filter((document) => ownedRemoveIds.has(documentIdentity(document)) && document.fileId)
+          .map((document) => String(document.fileId));
+        if (imagekitFileIds.length && imagekit) {
+          const deletionResults = await Promise.allSettled(imagekitFileIds.map((fileId) => imagekit.deleteFile(fileId)));
+          const failedImageKitDeletes = deletionResults.filter((result) => result.status === "rejected").length;
+          if (failedImageKitDeletes) {
+            console.error(`ImageKit cleanup failed for ${failedImageKitDeletes} document(s) after tenant record update.`);
+          }
+        }
 
         if (inv) {
           await Invite.updateOne(

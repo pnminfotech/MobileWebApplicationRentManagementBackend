@@ -270,22 +270,83 @@
 // routes/tenantRoutes.js
 const express = require('express');
 const router = express.Router();
+const path = require('path');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const mongoose = require('mongoose');
 const QRCode = require('qrcode');
 
 const Form = require('../models/formModels');
 const OtpSession = require('../models/OtpSession');
 const authTenant = require('../middleware/tenantAuth');
-const { docsUpload, avatarUpload, ekycUpload } = require('../lib/upload');
 const Payment = require('../models/Payment');
-const path = require('path');
-const fs = require('fs');
+const multer = require('multer');
+const sharp = require('sharp');
+const ImageKit = require('imagekit');
+const { getTenantJwtSecret } = require('../config/tenantJwt');
+const { sendTenantLoginOtp } = require('../services/smsService');
+const {
+  createAuthRateLimit,
+  requestIp,
+  challengeIdentifier,
+} = require('../middleware/authRateLimit');
 
 /* ------------------------------------------------------------------ */
 /* Helpers kept in this file (no new files created)                    */
 /* ------------------------------------------------------------------ */
 const ALLOWED_IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png']);
 const ALLOWED_IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png']);
+const MAX_IMAGE_UPLOAD_SIZE = 2 * 1024 * 1024;
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_IMAGE_UPLOAD_SIZE, files: 10 },
+  fileFilter: (_req, file, callback) => {
+    if (!isAllowedImageFile(file)) {
+      const error = new Error('Only JPG, JPEG, and PNG files are allowed.');
+      error.status = 400;
+      return callback(error);
+    }
+    callback(null, true);
+  },
+});
+
+function getImageKit() {
+  if (!process.env.IMAGEKIT_PUBLIC_KEY || !process.env.IMAGEKIT_PRIVATE_KEY || !process.env.IMAGEKIT_URL_ENDPOINT) {
+    return null;
+  }
+  return new ImageKit({
+    publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
+    privateKey: process.env.IMAGEKIT_PRIVATE_KEY,
+    urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT,
+  });
+}
+
+async function uploadTenantImages(files, folder) {
+  const imagekit = getImageKit();
+  if (!imagekit) {
+    const error = new Error('ImageKit is not configured.');
+    error.status = 503;
+    throw error;
+  }
+  return Promise.all(files.map(async (file) => {
+    const safeName = String(file.originalname || 'image').replace(/[^\\w.\\-]/g, '_');
+    const buffer = await sharp(file.buffer).rotate().webp({ quality: 82 }).toBuffer();
+    const uploaded = await imagekit.upload({
+      file: buffer,
+      fileName: `${Date.now()}_${safeName}.webp`,
+      folder,
+      useUniqueFileName: true,
+    });
+    return {
+      fileName: file.originalname,
+      url: uploaded.url,
+      fileId: uploaded.fileId,
+      filePath: uploaded.filePath,
+      contentType: 'image/webp',
+      size: buffer.length,
+    };
+  }));
+}
 
 function isAllowedImageFile(file) {
   if (!file) return false;
@@ -302,243 +363,164 @@ function normalizePhone(raw) {
   return digits.slice(-10);
 }
 
-const TENANT_JWT_SECRET = process.env.TENANT_JWT_SECRET || 'dev_secret';
-const DEV_SHOW_OTP = process.env.DEV_SHOW_OTP === '1'; // set to 1 on Render to return devCode in prod
+const tenantOtpRequestIpLimit = createAuthRateLimit({
+  name: 'tenant-otp-request-ip',
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyFromRequest: requestIp,
+  countSuccessfulRequests: true,
+});
+const tenantOtpRequestPhoneLimit = createAuthRateLimit({
+  name: 'tenant-otp-request-phone',
+  windowMs: 15 * 60 * 1000,
+  max: 3,
+  keyFromRequest: (req) => normalizePhone(req.body?.phone),
+  countSuccessfulRequests: true,
+});
+const tenantOtpVerifyIpLimit = createAuthRateLimit({
+  name: 'tenant-otp-verify-ip',
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyFromRequest: requestIp,
+});
+const tenantOtpVerifyChallengeLimit = createAuthRateLimit({
+  name: 'tenant-otp-verify-challenge',
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  keyFromRequest: challengeIdentifier,
+});
+
+function hashTenantOtp(otpId, phone, code) {
+  return crypto
+    .createHmac('sha256', getTenantJwtSecret())
+    .update(`${otpId}:${phone}:${code}`)
+    .digest('hex');
+}
+
+function validTenantPhone(phone) {
+  return /^[6-9]\d{9}$/.test(phone);
+}
 
 // Debug ping (optional)
 router.get('/auth/ping', (req, res) => res.json({ ok: true, at: '/api/tenant/auth/ping' }));
 
-/* ------------------------------------------------------------------ */
-/* AUTH (OTP)                                                          */
-/* ------------------------------------------------------------------ */
-// router.post('/auth/request-otp', async (req, res) => {
-//   try {
-//     const phoneNorm = normalizePhone(req.body?.phone);
-//     if (!phoneNorm) return res.status(400).json({ message: "phone required" });
-
-//     const code =
-//       (process.env.NODE_ENV === 'production' && !DEV_SHOW_OTP)
-//         ? String(Math.floor(100000 + Math.random() * 900000))
-//         : '123456';
-
-//     await OtpSession.deleteMany({ phone: phoneNorm });
-//     await OtpSession.create({
-//       phone: phoneNorm,
-//       code,
-//       expiresAt: new Date(Date.now() + 5 * 60 * 1000) // 5 minutes
-//     });
-
-//     // Return devCode only if DEV_SHOW_OTP=1 (safe for live testing)
-//     res.json({
-//       ok: true,
-//       expiresIn: 300,
-//       devCode: DEV_SHOW_OTP ? code : undefined
-//     });
-//   } catch (e) {
-//     console.error('request-otp error:', e);
-//     res.status(500).json({ message: 'request-otp failed' });
-//   }
-// });
-
-// router.post('/auth/verify', async (req, res) => {
-//   try {
-//     const phoneNorm = normalizePhone(req.body?.phone);
-//     const code = String(req.body?.code || req.body?.otp || '').trim();
-
-//     if (!phoneNorm || !code) {
-//       return res.status(400).json({ message: "phone & code required" });
-//     }
-
-//     const sess = await OtpSession.findOne({ phone: phoneNorm, code });
-//     if (!sess || new Date(sess.expiresAt) < new Date()) {
-//       return res.status(400).json({ message: "Invalid/expired code" });
-//     }
-
-//     // Try to find tenant with phoneNo stored either as string (normalized) OR legacy numeric
-//     let me = await Form.findOne({
-//       $or: [
-//         { phoneNo: phoneNorm },
-//         { phoneNo: Number(phoneNorm) }
-//       ]
-//     });
-
-//     if (!me) {
-//       return res.status(404).json({ message: "Tenant not found" });
-//     }
-
-//     await OtpSession.deleteMany({ phone: phoneNorm });
-
-//     const token = jwt.sign(
-//       { id: me._id.toString() },
-//       TENANT_JWT_SECRET, // must match middleware
-//       { expiresIn: '30d' }
-//     );
-
-//     res.json({ token });
-//   } catch (e) {
-//     console.error('verify error:', e);
-//     res.status(500).json({ message: 'verify failed' });
-//   }
-// });
-
-/* ------------------------------------------------------------------ */
-/* ------------------------------------------------------------------ */
-/* AUTH (OTP) – always echo code back for frontend (DEV-only)         */
-/* ------------------------------------------------------------------ */
-router.post('/auth/request-otp', async (req, res) => {
+router.post('/auth/request-otp', tenantOtpRequestIpLimit, tenantOtpRequestPhoneLimit, async (req, res) => {
   try {
     const phoneNorm = normalizePhone(req.body?.phone);
-    if (!phoneNorm) return res.status(400).json({ message: "phone required" });
+    if (!validTenantPhone(phoneNorm)) {
+      return res.status(400).json({ message: 'Enter a valid 10-digit mobile number.' });
+    }
 
-    // Always random 6-digit
-    const code = String(Math.floor(100000 + Math.random() * 900000));
-
-    // 1 OTP row per phone (simplest). If you want multiple, remove deleteMany.
-    await OtpSession.deleteMany({ phone: phoneNorm });
-    const sess = await OtpSession.create({
-      phone: phoneNorm,
-      code,
-      expiresAt: new Date(Date.now() + 5 * 60 * 1000) // 5 minutes
+    const tenant = await Form.findOne({
+      $or: [{ phoneNo: phoneNorm }, { phoneNo: Number(phoneNorm) }],
     });
-
-    // 👇 Echo back code + otpId so frontend can display
-    res.json({
+    const genericResponse = {
       ok: true,
-      otpId: String(sess._id),
-      code,              // <-- visible to client
-      expiresIn: 300
+      message: 'If this number is registered, a verification code has been sent.',
+      expiresIn: 300,
+    };
+    if (!tenant) return res.json(genericResponse);
+
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    await OtpSession.deleteMany({ phone: phoneNorm, purpose: 'tenant_login' });
+    const otpId = new mongoose.Types.ObjectId();
+    const challenge = await OtpSession.create({
+      _id: otpId,
+      phone: phoneNorm,
+      codeHash: hashTenantOtp(otpId, phoneNorm, code),
+      purpose: 'tenant_login',
+      expiresAt: new Date(Date.now() + 5 * 60 * 1000),
     });
-  } catch (e) {
-    console.error('request-otp error:', e);
-    res.status(500).json({ message: 'request-otp failed' });
+
+    let delivery;
+    try {
+      delivery = await sendTenantLoginOtp({ tenant, code });
+    } catch (error) {
+      await OtpSession.deleteOne({ _id: challenge._id });
+      console.error('tenant OTP delivery failed:', error?.message || error);
+      return res.status(503).json({ message: 'Unable to send a verification code right now. Please try again later.' });
+    }
+
+    if (!delivery?.sent) {
+      if (process.env.NODE_ENV === 'production') {
+        await OtpSession.deleteOne({ _id: challenge._id });
+        return res.status(503).json({ message: 'Tenant SMS verification is not configured. Please contact support.' });
+      }
+      return res.json({ ...genericResponse, otpId: String(challenge._id), devCode: code });
+    }
+
+    return res.json({ ...genericResponse, otpId: String(challenge._id) });
+  } catch (error) {
+    console.error('tenant OTP request failed:', error?.message || error);
+    return res.status(500).json({ message: 'Unable to request a verification code.' });
   }
 });
 
-router.post('/auth/verify', async (req, res) => {
+router.post('/auth/verify', tenantOtpVerifyIpLimit, tenantOtpVerifyChallengeLimit, async (req, res) => {
   try {
     const phoneNorm = normalizePhone(req.body?.phone);
     const code = String(req.body?.code || req.body?.otp || '').trim();
-    const otpId = req.body?.otpId ? String(req.body.otpId) : null;
-
-    if (!phoneNorm || !code) {
-      return res.status(400).json({ message: "phone & code required" });
+    const otpId = String(req.body?.otpId || '').trim();
+    if (!validTenantPhone(phoneNorm) || !mongoose.Types.ObjectId.isValid(otpId) || !/^\d{6}$/.test(code)) {
+      return res.status(400).json({ message: 'The verification code is invalid or expired. Request a new code.' });
     }
 
-    // Prefer otpId when provided, else fall back to (phone+code)
-    let sess = null;
-    if (otpId) {
-      sess = await OtpSession.findOne({ _id: otpId, phone: phoneNorm, code });
-    } else {
-      sess = await OtpSession.findOne({ phone: phoneNorm, code }).sort({ _id: -1 });
-    }
-
-    if (!sess || new Date(sess.expiresAt) < new Date()) {
-      return res.status(400).json({ message: "Invalid/expired code" });
-    }
-
-    // Find tenant by phone (string last10 or legacy number)
-    const me = await Form.findOne({
-      $or: [
-        { phoneNo: phoneNorm },
-        { phoneNo: Number(phoneNorm) }
-      ]
-    });
-    if (!me) return res.status(404).json({ message: "Tenant not found" });
-
-    // One-time OTP
-    await OtpSession.deleteMany({ phone: phoneNorm });
-
-    const token = jwt.sign(
-      { id: me._id.toString() },
-      TENANT_JWT_SECRET,       // must match your authTenant middleware
-      { expiresIn: '30d' }
-    );
-
-    res.json({ token });
-  } catch (e) {
-    console.error('verify error:', e);
-    res.status(500).json({ message: 'verify failed' });
-  }
-});
-/* ------------------------------------------------------------------ */
-/* AUTH (OTP) – always echo code back for frontend (DEV-only)         */
-/* ------------------------------------------------------------------ */
-router.post('/auth/request-otp', async (req, res) => {
-  try {
-    const phoneNorm = normalizePhone(req.body?.phone);
-    if (!phoneNorm) return res.status(400).json({ message: "phone required" });
-
-    // Always random 6-digit
-    const code = String(Math.floor(100000 + Math.random() * 900000));
-
-    // 1 OTP row per phone (simplest). If you want multiple, remove deleteMany.
-    await OtpSession.deleteMany({ phone: phoneNorm });
-    const sess = await OtpSession.create({
+    const now = new Date();
+    const challenge = await OtpSession.findOne({
+      _id: otpId,
       phone: phoneNorm,
-      code,
-      expiresAt: new Date(Date.now() + 5 * 60 * 1000) // 5 minutes
+      purpose: 'tenant_login',
+      expiresAt: { $gt: now },
+      attempts: { $lt: 5 },
     });
-
-    // 👇 Echo back code + otpId so frontend can display
-    res.json({
-      ok: true,
-      otpId: String(sess._id),
-      code,              // <-- visible to client
-      expiresIn: 300
-    });
-  } catch (e) {
-    console.error('request-otp error:', e);
-    res.status(500).json({ message: 'request-otp failed' });
-  }
-});
-
-router.post('/auth/verify', async (req, res) => {
-  try {
-    const phoneNorm = normalizePhone(req.body?.phone);
-    const code = String(req.body?.code || req.body?.otp || '').trim();
-    const otpId = req.body?.otpId ? String(req.body.otpId) : null;
-
-    if (!phoneNorm || !code) {
-      return res.status(400).json({ message: "phone & code required" });
+    if (!challenge) {
+      return res.status(400).json({ message: 'The verification code is invalid or expired. Request a new code.' });
     }
 
-    // Prefer otpId when provided, else fall back to (phone+code)
-    let sess = null;
-    if (otpId) {
-      sess = await OtpSession.findOne({ _id: otpId, phone: phoneNorm, code });
-    } else {
-      sess = await OtpSession.findOne({ phone: phoneNorm, code }).sort({ _id: -1 });
+    const expectedHash = hashTenantOtp(challenge._id, phoneNorm, code);
+    const matches = crypto.timingSafeEqual(
+      Buffer.from(challenge.codeHash, 'hex'),
+      Buffer.from(expectedHash, 'hex')
+    );
+    if (!matches) {
+      await OtpSession.updateOne(
+        { _id: challenge._id, attempts: { $lt: 5 }, expiresAt: { $gt: now } },
+        { $inc: { attempts: 1 } }
+      );
+      return res.status(400).json({ message: 'The verification code is incorrect.' });
     }
 
-    if (!sess || new Date(sess.expiresAt) < new Date()) {
-      return res.status(400).json({ message: "Invalid/expired code" });
-    }
-
-    // Find tenant by phone (string last10 or legacy number)
-    const me = await Form.findOne({
-      $or: [
-        { phoneNo: phoneNorm },
-        { phoneNo: Number(phoneNorm) }
-      ]
+    const tenant = await Form.findOne({
+      $or: [{ phoneNo: phoneNorm }, { phoneNo: Number(phoneNorm) }],
     });
-    if (!me) return res.status(404).json({ message: "Tenant not found" });
+    if (!tenant) {
+      await OtpSession.deleteOne({ _id: challenge._id });
+      return res.status(400).json({ message: 'The verification code is invalid or expired. Request a new code.' });
+    }
 
-    // One-time OTP
-    await OtpSession.deleteMany({ phone: phoneNorm });
+    const consumed = await OtpSession.findOneAndDelete({
+      _id: challenge._id,
+      phone: phoneNorm,
+      codeHash: expectedHash,
+      purpose: 'tenant_login',
+      expiresAt: { $gt: now },
+      attempts: { $lt: 5 },
+    });
+    if (!consumed) {
+      return res.status(400).json({ message: 'The verification code is invalid or expired. Request a new code.' });
+    }
 
     const token = jwt.sign(
-      { id: me._id.toString() },
-      TENANT_JWT_SECRET,       // must match your authTenant middleware
+      { id: tenant._id.toString() },
+      getTenantJwtSecret(),
       { expiresIn: '30d' }
     );
-
-    res.json({ token });
-  } catch (e) {
-    console.error('verify error:', e);
-    res.status(500).json({ message: 'verify failed' });
+    return res.json({ token });
+  } catch (error) {
+    console.error('tenant OTP verification failed:', error?.message || error);
+    return res.status(500).json({ message: 'Unable to verify the code.' });
   }
 });
-
 /* ME                                                                  */
 /* ------------------------------------------------------------------ */
 router.get('/me', authTenant, async (req, res) => res.json(req.tenant));
@@ -556,40 +538,33 @@ router.put('/profile', authTenant, async (req, res) => {
   res.json(req.tenant);
 });
 
-router.post('/profile/avatar', authTenant, avatarUpload.single('avatar'), async (req, res) => {
-  if (req.fileValidationError) {
-    return res.status(400).json({ message: req.fileValidationError });
+router.post('/profile/avatar', authTenant, imageUpload.single('avatar'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: 'A JPG, JPEG, or PNG image is required.' });
+    const [uploaded] = await uploadTenantImages([req.file], '/rent-management-mobile-app/avatars');
+    req.tenant.avatarUrl = uploaded.url;
+    await req.tenant.save();
+    res.json({ avatarUrl: uploaded.url });
+  } catch (error) {
+    res.status(error.status || 500).json({ message: error.message || 'Avatar upload failed.' });
   }
-  if (!req.file) return res.status(400).json({ message: "no file" });
-  const url = `/uploads/avatars/${req.file.filename}`;
-  req.tenant.avatarUrl = url;
-  await req.tenant.save();
-  res.json({ avatarUrl: url });
 });
 
 /* ------------------------------------------------------------------ */
 /* DOCS                                                                */
 /* ------------------------------------------------------------------ */
-router.post('/docs', authTenant, docsUpload.array('documents'), async (req, res) => {
-  if (req.fileValidationError) {
-    (req.files || []).forEach((file) => {
-      try {
-        if (file?.path) fs.unlinkSync(file.path);
-      } catch (_) {}
-    });
-    return res.status(400).json({ message: req.fileValidationError });
+router.post('/docs', authTenant, imageUpload.array('documents', 10), async (req, res) => {
+  try {
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ message: 'At least one JPG, JPEG, or PNG document is required.' });
+    const uploaded = await uploadTenantImages(files, '/rent-management-mobile-app/tenant_docs');
+    const mapped = uploaded.map((file) => ({ ...file, relation: 'Self' }));
+    req.tenant.documents = [...(req.tenant.documents || []), ...mapped];
+    await req.tenant.save();
+    res.json({ ok: true, added: mapped.length, documents: mapped });
+  } catch (error) {
+    res.status(error.status || 500).json({ message: error.message || 'Document upload failed.' });
   }
-  const files = req.files || [];
-  const mapped = files.map((f) => ({
-    fileName: f.originalname,
-    url: `/uploads/docs/${f.filename}`,
-    contentType: f.mimetype,
-    size: f.size,
-    relation: "Self",
-  }));
-  req.tenant.documents = [...(req.tenant.documents || []), ...mapped];
-  await req.tenant.save();
-  res.json({ ok: true, added: mapped.length });
 });
 
 /* ------------------------------------------------------------------ */
@@ -644,49 +619,32 @@ router.get('/announcements', authTenant, async (_req, res) => {
 /* ------------------------------------------------------------------ */
 router.get('/ekyc', authTenant, async (req, res) => res.json(req.tenant.ekyc || { status: "not_started" }));
 
-router.post('/ekyc', authTenant, ekycUpload.fields([
+router.post('/ekyc', authTenant, imageUpload.fields([
   { name: 'docs', maxCount: 10 },
   { name: 'selfie', maxCount: 1 },
 ]), async (req, res) => {
-  if (req.fileValidationError) {
-    [...(req.files?.docs || []), ...(req.files?.selfie || [])].forEach((file) => {
-      try {
-        if (file?.path) fs.unlinkSync(file.path);
-      } catch (_) {}
-    });
-    return res.status(400).json({ message: req.fileValidationError });
+  try {
+    const files = [...(req.files?.docs || []), ...(req.files?.selfie || [])];
+    if (!files.length) return res.status(400).json({ message: 'At least one JPG, JPEG, or PNG image is required.' });
+    const uploaded = await uploadTenantImages(files, '/rent-management-mobile-app/ekyc');
+    const docCount = (req.files?.docs || []).length;
+    const docs = uploaded.slice(0, docCount).map((file) => ({ ...file, relation: 'Self' }));
+    const selfieUrl = uploaded[docCount]?.url;
+    const { aadhaarLast4, panLast4 } = req.body;
+
+    req.tenant.ekyc = {
+      ...(req.tenant.ekyc || {}),
+      status: 'pending',
+      aadhaarLast4,
+      panLast4,
+      selfieUrl: selfieUrl || req.tenant.ekyc?.selfieUrl,
+      docs: [...(req.tenant.ekyc?.docs || []), ...docs],
+    };
+    await req.tenant.save();
+    res.json({ ok: true, ekyc: req.tenant.ekyc });
+  } catch (error) {
+    res.status(error.status || 500).json({ message: error.message || 'eKYC upload failed.' });
   }
-
-  const invalidFiles = [
-    ...(req.files?.docs || []),
-    ...(req.files?.selfie || []),
-  ].filter((file) => !isAllowedImageFile(file));
-
-  if (invalidFiles.length) {
-    return res.status(400).json({ message: "Only JPG, JPEG, and PNG files are allowed." });
-  }
-
-  const { aadhaarLast4, panLast4 } = req.body;
-  const docs = (req.files?.docs || []).map(f => ({
-    fileName: f.originalname,
-    url: `/uploads/ekyc/${f.filename}`,
-    contentType: f.mimetype,
-    size: f.size,
-    relation: "Self",
-  }));
-  const selfie = (req.files?.selfie || [])[0];
-  const selfieUrl = selfie ? `/uploads/ekyc/${selfie.filename}` : undefined;
-
-  req.tenant.ekyc = {
-    ...(req.tenant.ekyc || {}),
-    status: "pending",
-    aadhaarLast4,
-    panLast4,
-    selfieUrl: selfieUrl || req.tenant.ekyc?.selfieUrl,
-    docs: [ ...(req.tenant.ekyc?.docs || []), ...docs ],
-  };
-  await req.tenant.save();
-  res.json({ ok: true, ekyc: req.tenant.ekyc });
 });
 
 /* ------------------------------------------------------------------ */

@@ -3,11 +3,13 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const MaintenanceSchema = require("../models/Maintainance");
 const authAdmin = require("../middleware/adminAuth");
+const requireLegacyDataAccess = require("../middleware/requireLegacyDataAccess");
 
 const Maintenance =
   mongoose.models.Maintainance || mongoose.model("Maintainance", MaintenanceSchema);
 
 router.use(authAdmin);
+router.use(requireLegacyDataAccess);
 
 // Create a new schema
 router.post("/create", async (req, res) => {
@@ -112,8 +114,6 @@ router.delete("/delete-transaction/:schemaName/:transactionId", async (req, res)
 });
 
 router.put("/transactions/update/:id", async (req, res) => {
-    console.log("Received update request for ID:", req.params.id);
-    console.log("Request body:", req.body);
 
     try {
         const { id } = req.params;

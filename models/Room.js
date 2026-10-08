@@ -24,6 +24,7 @@ const RoomSchema = new mongoose.Schema(
       default: "bed",
     },
     category: { type: String, required: true }, // e.g. Fuge Building, Boys, Girls
+    roomCategory: { type: String, default: "" },
     hasWing: { type: Boolean, default: false },
     wingName: { type: String, default: "" },
     floorNo: { type: String, required: true },  // e.g. Ground, 1, 2nd, Basement

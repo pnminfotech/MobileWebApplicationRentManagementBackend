@@ -1,6 +1,6 @@
 const express = require("express");
-const router = express.Router();
 const path = require("path");
+const router = express.Router();
 const mongoose = require("mongoose");
 // Models
 // https://chatgpt.com/c/67c7fff1-a5a4-8000-a37d-5619da480851
@@ -8,17 +8,12 @@ const Project = require("../models/Project");
 const Supplier = require("../models/Supplier");
 const multer = require("multer"); // Import multer
 const authAdmin = require("../middleware/adminAuth");
+const requireLegacyDataAccess = require("../middleware/requireLegacyDataAccess");
 
 router.use(authAdmin);
+router.use(requireLegacyDataAccess);
 
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, "uploads/"); // Ensure 'uploads' directory exists
-  },
-  filename: function (req, file, cb) {
-    cb(null, Date.now() + path.extname(file.originalname)); // Unique filename
-  },
-});
+const ImageKit = require("imagekit");
 
 const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png"]);
 const ALLOWED_IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png"]);
@@ -42,14 +37,38 @@ function imageOnlyFileFilter(req, file, cb) {
   cb(null, false);
 }
 
-const upload = multer({ storage: storage, fileFilter: imageOnlyFileFilter });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: imageOnlyFileFilter,
+});
+
+function getImageKit() {
+  if (!process.env.IMAGEKIT_PUBLIC_KEY || !process.env.IMAGEKIT_PRIVATE_KEY || !process.env.IMAGEKIT_URL_ENDPOINT) {
+    return null;
+  }
+  return new ImageKit({
+    publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
+    privateKey: process.env.IMAGEKIT_PRIVATE_KEY,
+    urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT,
+  });
+}
+
+async function uploadProjectImage(file) {
+  const imagekit = getImageKit();
+  if (!imagekit) throw new Error("ImageKit is not configured.");
+  const uploaded = await imagekit.upload({
+    file: file.buffer,
+    fileName: `${Date.now()}${path.extname(file.originalname || ".jpg")}`,
+    folder: "/rent-management-mobile-app/projects",
+    useUniqueFileName: true,
+  });
+  return uploaded.url;
+}
 
 // Create Project
-router.post("/emp/projects", upload.single("image"), async (req, res) => {
+router.post("/emp/projects", authAdmin, upload.single("image"), async (req, res) => {
   try {
-    console.log("Received Data:", req.body); // Check text data
-    console.log("Received File:", req.file); // Check file data
-
     if (req.fileValidationError) {
       return res.status(400).json({ message: req.fileValidationError });
     }
@@ -62,13 +81,14 @@ router.post("/emp/projects", upload.single("image"), async (req, res) => {
 
     const { heading, date, description, totalAmount, remainingAmount } = req.body;
 
+    const imageUrl = req.file ? await uploadProjectImage(req.file) : "";
     const newProject = new Project({
       heading,
       date,
       description,
       totalAmount: totalAmount || null,
       remainingAmount: remainingAmount || null,
-      image: req.file ? req.file.filename : "", // Store filename
+      image: imageUrl,
     });
 
     await newProject.save();
@@ -80,7 +100,7 @@ router.post("/emp/projects", upload.single("image"), async (req, res) => {
 });
 
 // Get all projects
-router.get("/projects", async (req, res) => {
+router.get("/projects", authAdmin, async (req, res) => {
     try {
         const projects = await Project.find();
         res.json(projects);
@@ -89,7 +109,7 @@ router.get("/projects", async (req, res) => {
     }
 });
 // update project data
-router.put("/projects/:id", upload.single("image"), async (req, res) => {
+router.put("/projects/:id", authAdmin, upload.single("image"), async (req, res) => {
   try {
     const { heading, date, description, totalAmount, remainingAmount } = req.body;
     const updateData = { heading, date, description, totalAmount, remainingAmount };
@@ -104,7 +124,7 @@ router.put("/projects/:id", upload.single("image"), async (req, res) => {
       });
     }
 
-    if (req.file) updateData.image = req.file.filename; // Update image if a new one is uploaded
+    if (req.file) updateData.image = await uploadProjectImage(req.file);
 
     const updatedProject = await Project.findByIdAndUpdate(req.params.id, updateData, { new: true });
 
@@ -117,7 +137,7 @@ router.put("/projects/:id", upload.single("image"), async (req, res) => {
 });
 
 ///////////////////// to add material , amount, project, ///////////////////////////////////////////
-router.post('/projects/add-material/:projectId/:supplierId', async (req, res)=>{
+router.post('/projects/add-material/:projectId/:supplierId', authAdmin, async (req, res)=>{
   try{
     const {projectId , supplierId} =  req.params;
     const { name , amount , description , date} = req.body
@@ -150,7 +170,7 @@ router.post('/projects/add-material/:projectId/:supplierId', async (req, res)=>{
   }
 } )
 ///////////////////// to add New Supplier to the project ///////////////////////////////////////////
-router.post('/projects/add-supplier/:projectId', async(req, res)=>{
+router.post('/projects/add-supplier/:projectId', authAdmin, async(req, res)=>{
   try{
     const { projectId } = req.params;
     const { supplierId, name, phoneNo, materials } = req.body;
@@ -181,7 +201,7 @@ router.post('/projects/add-supplier/:projectId', async(req, res)=>{
 
 //////////////////////////////////////////////////////////////////////////////
 //to fexth Projects
-router.get("/projects/:projectId", async (req, res) => {
+router.get("/projects/:projectId", authAdmin, async (req, res) => {
     try {
       const project = await Project.findById(req.params.projectId).populate("suppliers");
       if (!project) {
@@ -195,7 +215,7 @@ router.get("/projects/:projectId", async (req, res) => {
   });
 
   //adding Employee to the project.
-router.post("/projects/:id/employees", async (req, res) => {
+router.post("/projects/:id/employees", authAdmin, async (req, res) => {
     try {
         const { name, phoneNo, roleOrMaterial, salaryOrTotalPayment} = req.body;
         const project = await Project.findById(req.params.id);
@@ -212,7 +232,7 @@ router.post("/projects/:id/employees", async (req, res) => {
 });
 
 // Used for adding Payemnts
-router.post("/projects/:projectId/employees/:employeeId/payments", async (req, res) => {
+router.post("/projects/:projectId/employees/:employeeId/payments", authAdmin, async (req, res) => {
     try {
         const { amount, date,  description } = req.body;
         const project = await Project.findById(req.params.projectId);
@@ -231,7 +251,7 @@ router.post("/projects/:projectId/employees/:employeeId/payments", async (req, r
 });
 
 //to add supplier to the project 
-router.post("/projects/:projectId/suppliers", async (req, res) => {
+router.post("/projects/:projectId/suppliers", authAdmin, async (req, res) => {
   try {
     const { projectId } = req.params;
     const { supplierId, materials, payment } = req.body;
@@ -302,7 +322,7 @@ router.post("/projects/:projectId/suppliers", async (req, res) => {
 
 
 //fetch all the supplier which are added into the project.
-router.get("/projects/:projectId/suppliers", async (req, res) => {
+router.get("/projects/:projectId/suppliers", authAdmin, async (req, res) => {
   try {
     const suppliers = await Supplier.find().select("name phoneNo _id");
     res.status(200).json(suppliers);
@@ -313,7 +333,7 @@ router.get("/projects/:projectId/suppliers", async (req, res) => {
 
 
 // add payemnts for employee
-router.post("/projectEmpayment/:projectId/employees/:employeeId/payments",async(req, res)=>{
+router.post("/projectEmpayment/:projectId/employees/:employeeId/payments", authAdmin, async(req, res)=>{
   try{
     const {projectId, employeeId} = req.params;
     const {amount , description} = req.body;
@@ -336,7 +356,7 @@ router.post("/projectEmpayment/:projectId/employees/:employeeId/payments",async(
 })
 
 //add supplier payment 
-router.post("/projectSpayment/:projectId/suppliers/:supplierId/materials/:materialId/payments", async(req, res)=>{
+router.post("/projectSpayment/:projectId/suppliers/:supplierId/materials/:materialId/payments", authAdmin, async(req, res)=>{
   try{ 
 
     const {projectId , supplierId, materialId} = req.params;
@@ -363,7 +383,7 @@ router.post("/projectSpayment/:projectId/suppliers/:supplierId/materials/:materi
 })
  
 // update payment details for supplier. 
-router.put("/project/:projectId/supplier/:supplierId/material/:materialId/payment/:paymentId", async(req, res)=>{
+router.put("/project/:projectId/supplier/:supplierId/material/:materialId/payment/:paymentId", authAdmin, async(req, res)=>{
   try{
     const { projectId, supplierId, materialId, paymentId } = req.params;
     const { amount, description, date } = req.body;
@@ -394,7 +414,7 @@ router.put("/project/:projectId/supplier/:supplierId/material/:materialId/paymen
 })
 
 //update payment for employee
-router.put("/project/:projectId/employee/:employeeId/payment/:paymentId", async(req , res)=>{
+router.put("/project/:projectId/employee/:employeeId/payment/:paymentId", authAdmin, async(req , res)=>{
   try{
     const { projectId, employeeId, paymentId } = req.params;
     const { amount, description, date } = req.body;
@@ -422,7 +442,7 @@ router.put("/project/:projectId/employee/:employeeId/payment/:paymentId", async(
   }
 })
 
-router.delete("/projects/:projectId/suppliers/:supplierId/materials/:materialId", async (req, res) => {
+router.delete("/projects/:projectId/suppliers/:supplierId/materials/:materialId", authAdmin, async (req, res) => {
   try {
     const { projectId, supplierId, materialId } = req.params;
 

@@ -2,6 +2,8 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const authAdmin = require("../middleware/adminAuth");
+const Form = require("../models/formModels");
+const { scopedQuery } = require("../utils/organizationScope");
 
 const router = express.Router();
 router.use(authAdmin);
@@ -12,6 +14,15 @@ router.get("/:id", async (req, res) => {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
       return res.status(404).json({ error: "DOCUMENT_NOT_FOUND", detail: "Invalid file id." });
+    }
+
+    if (!req.organizationId) {
+      return res.status(403).json({ error: "ORGANIZATION_SCOPE_REQUIRED" });
+    }
+
+    const ownsDocument = await Form.exists(scopedQuery(req, { "documents.fileId": id }));
+    if (!ownsDocument) {
+      return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
     }
 
     const db = mongoose.connection.db;

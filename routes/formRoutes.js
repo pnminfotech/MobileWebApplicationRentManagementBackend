@@ -284,7 +284,7 @@ router.post("/forms/import", async (req, res) => {
   }
 });
 
-router.get("/forms/rent-dues", async (req, res) => {
+router.get("/forms/rent-dues", authAdmin, async (req, res) => {
   try {
     const [tenants, rooms] = await Promise.all([
       Form.find(scopedQuery(req)).lean(),
@@ -323,7 +323,7 @@ router.get("/forms/rent-dues", async (req, res) => {
   }
 });
 
-router.post("/forms/rent-reminders/sms/run", async (req, res) => {
+router.post("/forms/rent-reminders/sms/run", authAdmin, async (req, res) => {
   try {
     const result = await sendRentReminderSmsJob({
       organizationId: req.organizationId,
@@ -336,7 +336,7 @@ router.post("/forms/rent-reminders/sms/run", async (req, res) => {
   }
 });
 
-router.get("/forms/rent-summary", async (req, res) => {
+router.get("/forms/rent-summary", authAdmin, async (req, res) => {
   try {
     const parsed = parseMonthKey(String(req.query.month || ""));
     if (!parsed) return res.status(400).json({ message: "Valid month is required" });
@@ -383,7 +383,7 @@ router.get("/forms/rent-summary", async (req, res) => {
   }
 });
 
-router.get("/forms/rent-range-summary", async (req, res) => {
+router.get("/forms/rent-range-summary", authAdmin, async (req, res) => {
   try {
     const start = new Date(req.query.start);
     const end = new Date(req.query.end);
@@ -408,7 +408,7 @@ router.get("/forms/rent-range-summary", async (req, res) => {
   }
 });
 
-router.get("/form/:id/rent-due", async (req, res) => {
+router.get("/form/:id/rent-due", authAdmin, async (req, res) => {
   try {
     const [tenant, rooms] = await Promise.all([
       Form.findOne(scopedQuery(req, { _id: req.params.id })).lean(),
@@ -428,7 +428,7 @@ router.get("/form/:id/rent-due", async (req, res) => {
   }
 });
 
-router.get("/form/:id/rent-quote", async (req, res) => {
+router.get("/form/:id/rent-quote", authAdmin, async (req, res) => {
   try {
     const parsed = parseMonthKey(String(req.query.month || ""));
     if (!parsed) return res.status(400).json({ message: "Valid month is required" });

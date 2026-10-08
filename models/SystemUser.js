@@ -29,6 +29,9 @@ const systemUserSchema = new mongoose.Schema(
       index: true,
     },
     lastLoginAt: { type: Date },
+    lastWebActivityAt: { type: Date, default: null },
+    // Starts at 1 so JWTs issued before session-version checks are rejected.
+    sessionVersion: { type: Number, default: 1 },
   },
   { timestamps: true }
 );

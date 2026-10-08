@@ -16,6 +16,12 @@ function buildMockPaymentUrl(transaction) {
 async function createPaymentIntent({ transaction, organization, subscription }) {
   const provider = getPaymentProviderName();
 
+  if (process.env.NODE_ENV === "production" && provider === "mock") {
+    const error = new Error("Mock payments are disabled in production.");
+    error.status = 503;
+    throw error;
+  }
+
   if (provider === "phonepe") {
     return createPhonePePayment({ transaction, organization, subscription });
   }

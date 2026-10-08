@@ -1,6 +1,7 @@
 // middleware/requireTenantAuth.js
 const jwt = require("jsonwebtoken");
 const Form = require("../models/formModels"); // your single source of truth
+const { getTenantJwtSecret } = require("../config/tenantJwt");
 
 // Helper: extract bearer token
 function getToken(req) {
@@ -21,12 +22,7 @@ module.exports = async function requireTenantAuth(req, res, next) {
     // 1) Try JWT first (recommended)
     const token = getToken(req);
     if (token) {
-      const secret =
-        process.env.TENANT_JWT_SECRET ||
-        process.env.JWT_SECRET ||
-        process.env.JWT_TOKEN ||
-        "changeme-in-env";
-      const payload = jwt.verify(token, secret);
+      const payload = jwt.verify(token, getTenantJwtSecret());
 
       // try common id keys in payload
       tenantId =
@@ -36,13 +32,6 @@ module.exports = async function requireTenantAuth(req, res, next) {
         payload.id ||
         payload._id ||
         null;
-    }
-
-    // 2) Dev fallback: allow x-tenant-id header or ?tenantId=...
-    if (!tenantId) {
-      const headerId = req.headers["x-tenant-id"];
-      const qsId = req.query.tenantId || req.query.tid;
-      tenantId = headerId || qsId || null;
     }
 
     if (!tenantId) {

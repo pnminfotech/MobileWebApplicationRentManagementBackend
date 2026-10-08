@@ -44,8 +44,8 @@ async function connectDB() {
     console.log("DB Connected");
     await dropObsoleteBedUniqueIndexes();
   } catch (err) {
-    // Do NOT crash the process; log and keep server running
     console.error("DB connect failed:", err.message);
+    throw err;
   }
 }
 

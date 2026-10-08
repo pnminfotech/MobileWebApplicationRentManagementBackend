@@ -59,6 +59,76 @@ async function sendPasswordResetEmail({ to, name, resetUrl, expiresMinutes = 15 
   });
 }
 
+async function sendSuperadminLoginCode({ to, name, code, expiresMinutes = 10 }) {
+  const transporter = getTransporter();
+  if (!transporter) {
+    const error = new Error("SMTP is not configured");
+    error.code = "SMTP_NOT_CONFIGURED";
+    throw error;
+  }
+
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const appName = process.env.APP_NAME || "Rent Management";
+
+  await transporter.sendMail({
+    from,
+    to,
+    subject: `${appName} superadmin sign-in code`,
+    text: [
+      `Hello ${name || "Superadmin"},`,
+      "",
+      `Your superadmin sign-in code is: ${code}`,
+      `It expires in ${expiresMinutes} minutes and can only be used once.`,
+      "",
+      "If you did not try to sign in, change your password and secure your email account.",
+    ].join("\n"),
+  });
+}
+
+async function sendSuperadminEmailChangeCode({ to, name, code, newEmail, expiresMinutes = 10 }) {
+  const transporter = getTransporter();
+  if (!transporter) {
+    const error = new Error("SMTP is not configured");
+    error.code = "SMTP_NOT_CONFIGURED";
+    throw error;
+  }
+
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const appName = process.env.APP_NAME || "Rent Management";
+  await transporter.sendMail({
+    from,
+    to,
+    subject: `${appName} email change verification`,
+    text: [
+      `Hello ${name || "Superadmin"},`,
+      "",
+      `Your code to change the superadmin sign-in email to ${newEmail} is: ${code}`,
+      `It expires in ${expiresMinutes} minutes and can only be used once.`,
+      "",
+      "If you did not request this change, ignore this email and secure your account.",
+    ].join("\n"),
+  });
+}
+
+async function sendSuperadminEmailChangedNotice({ to, name, newEmail }) {
+  const transporter = getTransporter();
+  if (!transporter) return;
+
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const appName = process.env.APP_NAME || "Rent Management";
+  await transporter.sendMail({
+    from,
+    to,
+    subject: `${appName} superadmin email changed`,
+    text: [
+      `Hello ${name || "Superadmin"},`,
+      "",
+      `The sign-in email for your superadmin account was changed to ${newEmail}.`,
+      "All active sessions were signed out. If you did not make this change, reset your password and contact support immediately.",
+    ].join("\n"),
+  });
+}
+
 async function sendBasicEmail({ to, subject, text, html }) {
   const transporter = getTransporter();
   if (!transporter) {
@@ -81,4 +151,7 @@ module.exports = {
   hasSmtpConfig,
   sendBasicEmail,
   sendPasswordResetEmail,
+  sendSuperadminLoginCode,
+  sendSuperadminEmailChangeCode,
+  sendSuperadminEmailChangedNotice,
 };

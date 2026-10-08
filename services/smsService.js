@@ -153,6 +153,17 @@ async function sendAdmissionSms(tenant = {}, organization = {}) {
   });
 }
 
+async function sendTenantLoginOtp({ tenant = {}, code }) {
+  const name = tenant.name || "Tenant";
+  const message = `Your ${smsBrandName()} verification code is ${code}. It expires in 5 minutes. Do not share this code.`;
+  return sendSms({
+    to: tenant.phoneNo,
+    message,
+    templateId: process.env.SMS_TEMPLATE_TENANT_OTP_ID,
+    variables: { name, otp: String(code), brand: smsBrandName() },
+  });
+}
+
 async function sendPaymentReceivedSms({ tenant, organization, amountPaid, billingMonth, balanceDue }) {
   const variables = {
     name: tenant.name || "Tenant",
@@ -189,6 +200,7 @@ async function sendRentReminderSms({ tenant, organization, amountDue, billingMon
 
 module.exports = {
   sendAdmissionSms,
+  sendTenantLoginOtp,
   sendPaymentReceivedSms,
   sendRentReminderSms,
 };

@@ -7,8 +7,8 @@ const router = express.Router();
 
 const Form = require("../models/formModels");
 const Counter = require("../models/counterModel");
-const authAdmin = require("../middleware/adminAuth");
 const { attachSystemAuthIfPresent } = require("../middleware/saasAuth");
+const authAdmin = require("../middleware/adminAuth");
 const { scopedQuery, scopedCreate } = require("../utils/organizationScope");
 const { normalizeFirstRentCycle } = require("./_helpers/firstRentCycle");
 
@@ -20,9 +20,6 @@ const {
 } = require("./_helpers/rentHistory");
 
 const ImageKit = require("imagekit");
-
-router.use(attachSystemAuthIfPresent);
-router.use(authAdmin);
 
 function hasImageKitConfig() {
   return (
@@ -154,11 +151,10 @@ function toMealList(value) {
   return [...new Set(raw.map((meal) => String(meal || "").trim().toLowerCase()).filter((meal) => ["breakfast", "lunch", "dinner"].includes(meal)))];
 }
 
-router.post("/forms-with-docs", upload.array("documents", 10), async (req, res) => {
+router.post("/forms-with-docs", attachSystemAuthIfPresent, authAdmin, upload.array("documents", 10), async (req, res) => {
   try {
     const body = req.body || {};
     const formId = body.formId ? String(body.formId).trim() : null;
-    console.log("[forms-with-docs] firstRentStatus:", body.firstRentStatus, "firstRentMonth:", body.firstRentMonth);
 
     const toDate = (v) => (v ? new Date(v) : undefined);
     const toNum = (v) => (v !== undefined && v !== "" ? Number(v) : undefined);

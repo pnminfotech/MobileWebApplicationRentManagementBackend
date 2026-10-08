@@ -3,22 +3,17 @@ const jwt = require('jsonwebtoken');
 const User = require('../models/userModel'); // you already have this model
 const SystemUser = require('../models/SystemUser');
 const Organization = require('../models/Organization');
+const { getJwtSecret, validateSessionActivity } = require('./saasAuth');
 
 function getSaasJwtSecret() {
-  return (
-    process.env.SAAS_JWT_SECRET ||
-    process.env.JWT_SECRET ||
-    process.env.JWT_TOKEN ||
-    'dev_saas_secret'
-  );
+  return getJwtSecret();
 }
 
 function getLegacyJwtSecrets() {
   return [
     process.env.JWT_SECRET,
     process.env.JWT_TOKEN,
-    'your-secret-key',
-    'dev_secret',
+    ...(process.env.NODE_ENV === 'production' ? [] : ['your-secret-key', 'dev_secret']),
   ].filter(Boolean);
 }
 
@@ -44,6 +39,10 @@ async function trySystemAdminAuth(token, req, res, next) {
       res.status(401).json({ message: 'User not found' });
       return true;
     }
+    if (Number(payload.sessionVersion ?? 0) !== Number(user.sessionVersion || 0)) {
+      res.status(401).json({ message: 'Session expired. Please sign in again.' });
+      return true;
+    }
     if (user.status === 'suspended') {
       res.status(403).json({ message: 'Account suspended' });
       return true;
@@ -52,6 +51,7 @@ async function trySystemAdminAuth(token, req, res, next) {
       res.status(403).json({ message: 'System admin access required' });
       return true;
     }
+    if (!(await validateSessionActivity(user, payload, req, res))) return true;
     if (!user.organizationId) {
       res.status(403).json({ message: 'Organization required' });
       return true;

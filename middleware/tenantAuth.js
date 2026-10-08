@@ -55,8 +55,7 @@
 // middleware/tenantAuth.js
 const jwt = require("jsonwebtoken");
 const Form = require("../models/formModels");
-
-const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
+const { getTenantJwtSecret } = require("../config/tenantJwt");
 
 module.exports = async function authTenant(req, res, next) {
   try {
@@ -64,7 +63,7 @@ module.exports = async function authTenant(req, res, next) {
     const token = hdr.startsWith("Bearer ") ? hdr.slice(7) : null;
     if (!token) return res.status(401).json({ message: "Missing token" });
 
-    const payload = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(token, getTenantJwtSecret());
 
     const tenantId =
       payload.sub || payload.tenantId || payload.userId || payload.id || payload._id;

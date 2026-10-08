@@ -2,11 +2,11 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
-const path = require("path");
 
 dotenv.config();
 
 const { connectDB } = require("./config/db");
+const { validateSaasJwtSecret } = require("./middleware/saasAuth");
 const { startSubscriptionReminderJob } = require("./services/subscriptionReminderService");
 const { startRentReminderSmsJob } = require("./services/rentReminderSmsService");
 
@@ -20,7 +20,6 @@ const commercialRoutes = require("./routes/commercialRoutes");
 const lightBillRoutes = require("./routes/lightBillRoutes");
 const otherExpenseRoutes = require("./routes/otherExpenseRoutes");
 const uploadRoutes = require("./routes/uploadRoutes");
-const authRoutes = require("./routes/authRoutes");
 const formWithDocsRoutes = require("./routes/formWithDocs");
 const documentRoutes = require("./routes/documentRoutes");
 const tenantRoutes = require("./routes/tenant");
@@ -36,6 +35,17 @@ const auditLogRoutes = require("./routes/auditLogRoutes");
 const assistantRoutes = require("./routes/assistant");
 
 const app = express();
+
+// Trust forwarding headers only from a local reverse proxy such as Nginx.
+// This lets authentication throttles use the real client IP without trusting
+// spoofed X-Forwarded-For values from direct public requests.
+app.set("trust proxy", "loopback");
+
+// Never start a production API that would issue or accept SaaS JWTs with a
+// missing, short, or development fallback secret.
+if (process.env.NODE_ENV === "production") {
+  validateSaasJwtSecret();
+}
 
 const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:3000",
@@ -79,6 +89,7 @@ const corsOptions = {
     "X-Invite-Token",
     "X-Platform",
     "X-App-Version",
+    "X-User-Activity",
   ],
 };
 
@@ -86,9 +97,6 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: process.env.URLENCODED_BODY_LIMIT || "10mb" }));
-
-// Static files for uploaded content (if any local)
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 app.use("/api/tenant-docs", tenantDocsRoutes);
 app.use("/api/saas", saasRoutes);
@@ -108,7 +116,6 @@ app.get("/api/health", (_req, res) =>
 
 // Routes
 app.use("/api", require("./routes/notifications"));
-app.use("/api", authRoutes);
 app.use("/api/uploads", uploadRoutes);
 app.use("/api", formRoutes);
 app.use("/api", formWithDocsRoutes); // ✅ no trailing slash
@@ -134,12 +141,19 @@ app.use("/api/admin", adminLeaveRoutes);
 app.use("/api", require("./routes/tenantAttendance"));
 app.use("/api/admin", adminNotificationsRouter);
 
-connectDB();
-startSubscriptionReminderJob();
-startRentReminderSmsJob();
-
 const PORT = process.env.PORT || 8000;
-app.listen(PORT, () => {
-  console.log(`✅ Server running: http://localhost:${PORT}`);
-  console.log(`✅ Health:        http://localhost:${PORT}/api/health`);
+
+async function startServer() {
+  await connectDB();
+  startSubscriptionReminderJob();
+  startRentReminderSmsJob();
+  app.listen(PORT, () => {
+    console.log(`✅ Server running: http://localhost:${PORT}`);
+    console.log(`✅ Health:        http://localhost:${PORT}/api/health`);
+  });
+}
+
+startServer().catch((error) => {
+  console.error("Backend startup failed:", error?.message || error);
+  process.exit(1);
 });

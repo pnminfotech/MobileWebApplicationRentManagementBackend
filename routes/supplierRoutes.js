@@ -4,8 +4,10 @@ const mongoose = require("mongoose");
 const Supplier = require("../models/Supplier");
 const Project = require("../models/Project");
 const authAdmin = require("../middleware/adminAuth");
+const requireLegacyDataAccess = require("../middleware/requireLegacyDataAccess");
 
 router.use(authAdmin);
+router.use(requireLegacyDataAccess);
 
 //to fetch the supplier.
 router.get("/", async (req, res) => {

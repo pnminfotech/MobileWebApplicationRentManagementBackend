@@ -88,7 +88,7 @@ function toMonthKey(y, m /* 0..11 */) {
 /* =========================
  * LIST / READ NOTIFICATIONS
  * ========================= */
-router.get("/notifications", async (req, res) => {
+router.get("/notifications", authAdmin, async (req, res) => {
   try {
     const { status = "all", limit = 30 } = req.query;
     const q = scopedQuery(req, status === "all" ? {} : { status });
@@ -104,7 +104,7 @@ router.get("/notifications", async (req, res) => {
   }
 });
 
-router.post("/notifications/read-all", async (req, res) => {
+router.post("/notifications/read-all", authAdmin, async (req, res) => {
   try {
     const { status = "all" } = req.body || {};
     const q = scopedQuery(req, status === "all" ? {} : { status });
@@ -116,7 +116,7 @@ router.post("/notifications/read-all", async (req, res) => {
   }
 });
 
-router.patch("/notifications/:id/read", async (req, res) => {
+router.patch("/notifications/:id/read", authAdmin, async (req, res) => {
   try {
     const updated = await PaymentNotification.findOneAndUpdate(
       scopedQuery(req, { _id: req.params.id }),
@@ -137,7 +137,7 @@ router.patch("/notifications/:id/read", async (req, res) => {
  * - Upsert into Form.rents[] for that (month,year)
  * - Flip Notification.status -> approved + read
  */
-router.post("/approve/:id", async (req, res) => {
+router.post("/approve/:id", authAdmin, async (req, res) => {
   try {
     const notif = await PaymentNotification.findOne(scopedQuery(req, { _id: req.params.id }));
     if (!notif) return res.status(404).json({ message: "notification not found" });
@@ -232,7 +232,7 @@ await pay.save();
  * - Flip Payment.status -> rejected
  * - Flip Notification.status -> rejected + read
  */
-router.post("/reject/:id", async (req, res) => {
+router.post("/reject/:id", authAdmin, async (req, res) => {
   try {
     const notif = await PaymentNotification.findOne(scopedQuery(req, { _id: req.params.id }));
     if (!notif) return res.status(404).json({ message: "notification not found" });
@@ -273,7 +273,7 @@ router.post("/reject/:id", async (req, res) => {
 /* ============================
  * OPTIONAL: payments "reports"
  * ============================ */
-router.get("/reports", async (req, res) => {
+router.get("/reports", authAdmin, async (req, res) => {
   try {
     const { status = "all", limit = 50 } = req.query;
     const q = scopedQuery(req, status === "all" ? {} : { status });
@@ -288,7 +288,7 @@ router.get("/reports", async (req, res) => {
   }
 });
 // One-off: backfill missing notifications for reported payments
-router.post('/bootstrap-notifs', async (req, res) => {
+router.post('/bootstrap-notifs', authAdmin, async (req, res) => {
   try {
     const reported = await Payment.find(scopedQuery(req, { status: 'reported' })).lean();
     const made = [];

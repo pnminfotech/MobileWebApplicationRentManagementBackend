@@ -1,6 +1,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
+const mongoose = require("mongoose");
 
 const Organization = require("../models/Organization");
 const SystemUser = require("../models/SystemUser");
@@ -9,6 +10,8 @@ const ReferralCode = require("../models/ReferralCode");
 const Subscription = require("../models/Subscription");
 const BillingTransaction = require("../models/BillingTransaction");
 const PasswordResetToken = require("../models/PasswordResetToken");
+const LoginEmailChallenge = require("../models/LoginEmailChallenge");
+const SuperadminEmailChange = require("../models/SuperadminEmailChange");
 const Room = require("../models/Room");
 const Form = require("../models/formModels");
 const Payment = require("../models/Payment");
@@ -26,6 +29,7 @@ const Archive = require("../models/archiveSchema");
 const DuplicateForm = require("../models/DuplicateForm");
 const AuditLog = require("../models/AuditLog");
 const {
+  getJwtSecret,
   signSystemToken,
   requireSystemAuth,
   requireRole,
@@ -52,7 +56,12 @@ const {
   getWalletSummary,
   debitWalletUsageFromTransaction,
 } = require("../services/walletService");
-const { sendPasswordResetEmail } = require("../services/emailService");
+const {
+  sendPasswordResetEmail,
+  sendSuperadminLoginCode,
+  sendSuperadminEmailChangeCode,
+  sendSuperadminEmailChangedNotice,
+} = require("../services/emailService");
 const {
   notifyOrganization,
   notifySuperadmins,
@@ -66,8 +75,44 @@ const {
   refreshSubscriptionStateForOrganization,
 } = require("../services/subscriptionLifecycle");
 const { sendSubscriptionExpiryReminders } = require("../services/subscriptionReminderService");
+const {
+  createAuthRateLimit,
+  requestIp,
+  accountIdentifier,
+  resetTokenIdentifier,
+  challengeIdentifier,
+} = require("../middleware/authRateLimit");
 
 const router = express.Router();
+const bootstrapIpLimit = createAuthRateLimit({ name: "bootstrap-ip", windowMs: 60 * 60 * 1000, max: 3, keyFromRequest: requestIp });
+const registrationIpLimit = createAuthRateLimit({ name: "registration-ip", windowMs: 60 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
+const loginIpLimit = createAuthRateLimit({ name: "login-ip", windowMs: 15 * 60 * 1000, max: 10, keyFromRequest: requestIp });
+const loginAccountLimit = createAuthRateLimit({ name: "login-account", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: accountIdentifier });
+const loginCodeSendIpLimit = createAuthRateLimit({ name: "login-code-send-ip", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
+const loginCodeSendAccountLimit = createAuthRateLimit({ name: "login-code-send-account", windowMs: 60 * 60 * 1000, max: 3, keyFromRequest: accountIdentifier, countSuccessfulRequests: true });
+const loginCodeVerifyIpLimit = createAuthRateLimit({ name: "login-code-verify-ip", windowMs: 15 * 60 * 1000, max: 10, keyFromRequest: requestIp });
+const loginCodeVerifyChallengeLimit = createAuthRateLimit({ name: "login-code-verify-challenge", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: challengeIdentifier });
+const loginCodeResendIpLimit = createAuthRateLimit({ name: "login-code-resend-ip", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
+const loginCodeResendChallengeLimit = createAuthRateLimit({ name: "login-code-resend-challenge", windowMs: 15 * 60 * 1000, max: 2, keyFromRequest: challengeIdentifier, countSuccessfulRequests: true });
+const emailChangeStartIpLimit = createAuthRateLimit({ name: "superadmin-email-change-start-ip", windowMs: 60 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
+const emailChangeStartAccountLimit = createAuthRateLimit({ name: "superadmin-email-change-start-account", windowMs: 60 * 60 * 1000, max: 3, keyFromRequest: (req) => String(req.systemUser?._id || ""), countSuccessfulRequests: true });
+const emailChangeVerifyIpLimit = createAuthRateLimit({ name: "superadmin-email-change-verify-ip", windowMs: 15 * 60 * 1000, max: 10, keyFromRequest: requestIp });
+const emailChangeVerifyChallengeLimit = createAuthRateLimit({ name: "superadmin-email-change-verify-challenge", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: challengeIdentifier });
+const emailChangeResendIpLimit = createAuthRateLimit({ name: "superadmin-email-change-resend-ip", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
+const emailChangeResendChallengeLimit = createAuthRateLimit({ name: "superadmin-email-change-resend-challenge", windowMs: 15 * 60 * 1000, max: 2, keyFromRequest: challengeIdentifier, countSuccessfulRequests: true });
+const recoveryIpLimit = createAuthRateLimit({ name: "recovery-ip", windowMs: 60 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
+const recoveryAccountLimit = createAuthRateLimit({ name: "recovery-account", windowMs: 60 * 60 * 1000, max: 2, keyFromRequest: accountIdentifier, countSuccessfulRequests: true });
+const resetIpLimit = createAuthRateLimit({ name: "reset-ip", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: requestIp });
+const resetTokenLimit = createAuthRateLimit({ name: "reset-token", windowMs: 15 * 60 * 1000, max: 3, keyFromRequest: resetTokenIdentifier });
+
+function passRateLimits(req, res, limits) {
+  for (const limit of limits) {
+    let allowed = false;
+    limit(req, res, () => { allowed = true; });
+    if (!allowed) return false;
+  }
+  return true;
+}
 
 function userStatusForOrganization(status) {
   if (status === "active") return "active";
@@ -108,6 +153,34 @@ async function verifySuperadminSecurityPin(req, res) {
 
 function hashResetToken(token) {
   return crypto.createHash("sha256").update(String(token)).digest("hex");
+}
+
+function hashLoginCode(challengeId, code) {
+  return crypto
+    .createHmac("sha256", getJwtSecret())
+    .update(`${challengeId}:${code}`)
+    .digest("hex");
+}
+
+function maskedEmail(email) {
+  const [local = "", domain = ""] = String(email || "").split("@");
+  return `${local.slice(0, 1)}***@${domain}`;
+}
+
+async function deliverSuperadminLoginCode(user, challengeId, code) {
+  try {
+    await sendSuperadminLoginCode({ to: user.email, name: user.name, code, expiresMinutes: 10 });
+    return true;
+  } catch (error) {
+    await LoginEmailChallenge.updateOne(
+      { _id: challengeId, usedAt: null },
+      { $set: { usedAt: new Date() } }
+    );
+    if (error?.code !== "SMTP_NOT_CONFIGURED") {
+      console.error("superadmin login code email delivery failed:", error?.message || error);
+    }
+    return false;
+  }
 }
 
 function publicResetUrl(req, token) {
@@ -379,7 +452,11 @@ router.get("/health", (_req, res) => {
   res.json({ ok: true, module: "saas" });
 });
 
-router.post("/superadmin/bootstrap", async (req, res) => {
+router.post("/auth/session/activity", requireSystemAuth, (_req, res) => {
+  res.status(204).end();
+});
+
+router.post("/superadmin/bootstrap", bootstrapIpLimit, async (req, res) => {
   try {
     const existing = await SystemUser.exists({ role: "superadmin" });
     if (existing) {
@@ -387,6 +464,12 @@ router.post("/superadmin/bootstrap", async (req, res) => {
     }
 
     const setupSecret = process.env.SAAS_SETUP_SECRET;
+    if (process.env.NODE_ENV === "production" && !setupSecret) {
+      return res.status(503).json({ message: "Superadmin bootstrap is not configured." });
+    }
+    if (process.env.NODE_ENV === "production" && Buffer.byteLength(setupSecret, "utf8") < 32) {
+      return res.status(503).json({ message: "SAAS_SETUP_SECRET must be at least 32 bytes." });
+    }
     if (setupSecret && req.body?.setupSecret !== setupSecret) {
       return res.status(403).json({ message: "Invalid setup secret" });
     }
@@ -405,9 +488,11 @@ router.post("/superadmin/bootstrap", async (req, res) => {
       password,
       role: "superadmin",
       status: "active",
+      lastLoginAt: new Date(),
+      lastWebActivityAt: req.get("X-Platform") === "mobile" ? null : new Date(),
     });
 
-    res.status(201).json({ user: publicUser(user), token: signSystemToken(user) });
+    res.status(201).json({ user: publicUser(user), token: signSystemToken(user, req.get("X-Platform")) });
   } catch (err) {
     if (err?.code === 11000) {
       return res.status(409).json({ message: "Email already exists" });
@@ -417,7 +502,7 @@ router.post("/superadmin/bootstrap", async (req, res) => {
   }
 });
 
-router.post("/auth/login", async (req, res) => {
+router.post("/auth/login", loginIpLimit, loginAccountLimit, async (req, res) => {
   try {
     const login = String(req.body?.email || req.body?.loginId || "").trim().toLowerCase();
     const password = String(req.body?.password || "");
@@ -437,7 +522,43 @@ router.post("/auth/login", async (req, res) => {
       return res.status(403).json({ message: "Account suspended" });
     }
 
+    if (user.role === "superadmin") {
+      if (!passRateLimits(req, res, [loginCodeSendIpLimit, loginCodeSendAccountLimit])) return;
+
+      await LoginEmailChallenge.updateMany(
+        { userId: user._id, usedAt: null },
+        { $set: { usedAt: new Date() } }
+      );
+
+      const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+      const challengeId = new mongoose.Types.ObjectId();
+      const challenge = await LoginEmailChallenge.create({
+        _id: challengeId,
+        userId: user._id,
+        sessionVersion: Number(user.sessionVersion || 0),
+        clientPlatform: String(req.get("X-Platform") || "web").toLowerCase() === "mobile" ? "mobile" : "web",
+        codeHash: hashLoginCode(challengeId, code),
+        expiresAt,
+      });
+
+      const delivered = await deliverSuperadminLoginCode(user, challenge._id, code);
+      if (!delivered) {
+        return res.status(503).json({ message: "Unable to send the verification code. Check the server email settings or contact support." });
+      }
+
+      return res.json({
+        requiresEmailCode: true,
+        challengeId: String(challenge._id),
+        email: maskedEmail(user.email),
+        expiresInMinutes: 10,
+      });
+    }
+
     user.lastLoginAt = new Date();
+    if (String(req.get("X-Platform") || "web").toLowerCase() !== "mobile") {
+      user.lastWebActivityAt = user.lastLoginAt;
+    }
     await user.save();
 
     let organization = user.organizationId
@@ -450,7 +571,7 @@ router.post("/auth/login", async (req, res) => {
     }
 
     res.json({
-      token: signSystemToken(user),
+      token: signSystemToken(user, req.get("X-Platform")),
       user: publicUser(user),
       organization,
     });
@@ -460,7 +581,337 @@ router.post("/auth/login", async (req, res) => {
   }
 });
 
-router.post("/auth/forgot-password", async (req, res) => {
+router.post("/auth/login/verify-email", loginCodeVerifyIpLimit, loginCodeVerifyChallengeLimit, async (req, res) => {
+  try {
+    const challengeId = String(req.body?.challengeId || "").trim();
+    const code = String(req.body?.code || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(challengeId) || !/^\d{6}$/.test(code)) {
+      return res.status(400).json({ message: "The code is invalid or expired. Request a new code and try again." });
+    }
+
+    const now = new Date();
+    const challenge = await LoginEmailChallenge.findOne({
+      _id: challengeId,
+      usedAt: null,
+      expiresAt: { $gt: now },
+      attempts: { $lt: 5 },
+    });
+    if (!challenge) {
+      return res.status(400).json({ message: "The code is invalid or expired. Request a new code and try again." });
+    }
+
+    const expectedHash = hashLoginCode(challenge._id, code);
+    const matches = crypto.timingSafeEqual(
+      Buffer.from(challenge.codeHash, "hex"),
+      Buffer.from(expectedHash, "hex")
+    );
+    if (!matches) {
+      await LoginEmailChallenge.updateOne(
+        { _id: challenge._id, usedAt: null, expiresAt: { $gt: now }, attempts: { $lt: 5 } },
+        { $inc: { attempts: 1 } }
+      );
+      return res.status(400).json({ message: "The code is incorrect or expired." });
+    }
+
+    const consumed = await LoginEmailChallenge.findOneAndUpdate(
+      {
+        _id: challenge._id,
+        codeHash: expectedHash,
+        usedAt: null,
+        expiresAt: { $gt: now },
+        attempts: { $lt: 5 },
+      },
+      { $set: { usedAt: now }, $inc: { attempts: 1 } },
+      { new: true }
+    );
+    if (!consumed) {
+      return res.status(400).json({ message: "The code is invalid or expired. Request a new code and try again." });
+    }
+
+    const user = await SystemUser.findById(consumed.userId);
+    if (!user || user.role !== "superadmin") {
+      return res.status(400).json({ message: "Unable to complete sign-in. Please start again." });
+    }
+    if (Number(user.sessionVersion || 0) !== Number(consumed.sessionVersion)) {
+      return res.status(400).json({ message: "Your account changed during sign-in. Please start again." });
+    }
+    if (user.status === "suspended") {
+      return res.status(403).json({ message: "Account suspended" });
+    }
+
+    user.lastLoginAt = new Date();
+    if (consumed.clientPlatform !== "mobile") {
+      user.lastWebActivityAt = user.lastLoginAt;
+    }
+    await user.save();
+    res.json({ token: signSystemToken(user, consumed.clientPlatform), user: publicUser(user), organization: null });
+  } catch (err) {
+    console.error("superadmin email verification error:", err?.message || err);
+    res.status(500).json({ message: "Unable to verify the code. Please try again." });
+  }
+});
+
+router.post("/auth/login/resend-email-code", loginCodeResendIpLimit, loginCodeResendChallengeLimit, async (req, res) => {
+  try {
+    const challengeId = String(req.body?.challengeId || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(challengeId)) {
+      return res.status(400).json({ message: "Sign-in challenge is invalid or expired. Please sign in again." });
+    }
+
+    const challenge = await LoginEmailChallenge.findOne({
+      _id: challengeId,
+      usedAt: null,
+      expiresAt: { $gt: new Date() },
+    });
+    if (!challenge) {
+      return res.status(400).json({ message: "Sign-in challenge is invalid or expired. Please sign in again." });
+    }
+
+    const user = await SystemUser.findById(challenge.userId);
+    if (!user || user.role !== "superadmin" || user.status === "suspended") {
+      return res.status(400).json({ message: "Sign-in challenge is invalid or expired. Please sign in again." });
+    }
+    if (Number(user.sessionVersion || 0) !== Number(challenge.sessionVersion)) {
+      await LoginEmailChallenge.updateOne({ _id: challenge._id }, { $set: { usedAt: new Date() } });
+      return res.status(400).json({ message: "Your account changed during sign-in. Please sign in again." });
+    }
+
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+    const now = new Date();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    const updatedChallenge = await LoginEmailChallenge.findOneAndUpdate(
+      { _id: challenge._id, usedAt: null, expiresAt: { $gt: now }, resendCount: { $lt: 2 } },
+      { $set: { codeHash: hashLoginCode(challenge._id, code), expiresAt, attempts: 0 }, $inc: { resendCount: 1 } },
+      { new: true }
+    );
+    if (!updatedChallenge) {
+      return res.status(429).json({ message: "Code resend limit reached. Please sign in again later." });
+    }
+
+    const delivered = await deliverSuperadminLoginCode(user, challenge._id, code);
+    if (!delivered) {
+      return res.status(503).json({ message: "Unable to send the verification code. Check the server email settings or contact support." });
+    }
+
+    res.json({ email: maskedEmail(user.email), expiresInMinutes: 10 });
+  } catch (err) {
+    console.error("superadmin email code resend error:", err?.message || err);
+    res.status(500).json({ message: "Unable to resend the code. Please try again." });
+  }
+});
+
+router.post(
+  "/admin/security/email-change/request",
+  requireSystemAuth,
+  requireRole("superadmin"),
+  emailChangeStartIpLimit,
+  emailChangeStartAccountLimit,
+  async (req, res) => {
+    try {
+      const password = String(req.body?.password || "");
+      const newEmail = String(req.body?.newEmail || "").trim().toLowerCase();
+      if (!password || !(await req.systemUser.comparePassword(password))) {
+        return res.status(403).json({ message: "Current password is incorrect." });
+      }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail) || newEmail.length > 254) {
+        return res.status(400).json({ message: "Enter a valid new email address." });
+      }
+      if (newEmail === req.systemUser.email) {
+        return res.status(400).json({ message: "This is already your current email address." });
+      }
+      if (await SystemUser.exists({ email: newEmail })) {
+        return res.status(409).json({ message: "That email address is already in use." });
+      }
+
+      await SuperadminEmailChange.updateMany(
+        { userId: req.systemUser._id, usedAt: null },
+        { $set: { usedAt: new Date() } }
+      );
+      const challengeId = new mongoose.Types.ObjectId();
+      const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+      const challenge = await SuperadminEmailChange.create({
+        _id: challengeId,
+        userId: req.systemUser._id,
+        sessionVersion: Number(req.systemUser.sessionVersion || 0),
+        currentEmail: req.systemUser.email,
+        newEmail,
+        codeHash: hashLoginCode(challengeId, code),
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+      });
+
+      try {
+        await sendSuperadminEmailChangeCode({
+          to: newEmail,
+          name: req.systemUser.name,
+          code,
+          newEmail,
+          expiresMinutes: 10,
+        });
+      } catch (error) {
+        await SuperadminEmailChange.updateOne({ _id: challenge._id, usedAt: null }, { $set: { usedAt: new Date() } });
+        if (error?.code !== "SMTP_NOT_CONFIGURED") {
+          console.error("superadmin email change code delivery failed:", error?.message || error);
+        }
+        return res.status(503).json({ message: "Unable to send a code to that address. Check the address or contact support." });
+      }
+
+      return res.json({
+        challengeId: String(challenge._id),
+        email: maskedEmail(newEmail),
+        expiresInMinutes: 10,
+      });
+    } catch (err) {
+      console.error("superadmin email change request error:", err?.message || err);
+      return res.status(500).json({ message: "Unable to start the email change. Please try again." });
+    }
+  }
+);
+
+router.post(
+  "/admin/security/email-change/verify",
+  requireSystemAuth,
+  requireRole("superadmin"),
+  emailChangeVerifyIpLimit,
+  emailChangeVerifyChallengeLimit,
+  async (req, res) => {
+    try {
+      const challengeId = String(req.body?.challengeId || "").trim();
+      const code = String(req.body?.code || "").trim();
+      if (!mongoose.Types.ObjectId.isValid(challengeId) || !/^\d{6}$/.test(code)) {
+        return res.status(400).json({ message: "The code is invalid or expired. Request a new code and try again." });
+      }
+
+      const now = new Date();
+      const challenge = await SuperadminEmailChange.findOne({
+        _id: challengeId,
+        userId: req.systemUser._id,
+        usedAt: null,
+        expiresAt: { $gt: now },
+        attempts: { $lt: 5 },
+      });
+      if (!challenge || Number(req.systemUser.sessionVersion || 0) !== Number(challenge.sessionVersion)) {
+        return res.status(400).json({ message: "The code is invalid or expired. Start the email change again." });
+      }
+
+      const expectedHash = hashLoginCode(challenge._id, code);
+      const matches = crypto.timingSafeEqual(
+        Buffer.from(challenge.codeHash, "hex"),
+        Buffer.from(expectedHash, "hex")
+      );
+      if (!matches) {
+        await SuperadminEmailChange.updateOne(
+          { _id: challenge._id, userId: req.systemUser._id, usedAt: null, expiresAt: { $gt: now }, attempts: { $lt: 5 } },
+          { $inc: { attempts: 1 } }
+        );
+        return res.status(400).json({ message: "The code is incorrect or expired." });
+      }
+
+      const consumed = await SuperadminEmailChange.findOneAndUpdate(
+        { _id: challenge._id, userId: req.systemUser._id, codeHash: expectedHash, usedAt: null, expiresAt: { $gt: now }, attempts: { $lt: 5 } },
+        { $set: { usedAt: now }, $inc: { attempts: 1 } },
+        { new: true }
+      );
+      if (!consumed) {
+        return res.status(400).json({ message: "The code is invalid or expired. Start the email change again." });
+      }
+
+      const updatedUser = await SystemUser.findOneAndUpdate(
+        {
+          _id: req.systemUser._id,
+          role: "superadmin",
+          email: consumed.currentEmail,
+          sessionVersion: consumed.sessionVersion,
+        },
+        { $set: { email: consumed.newEmail }, $inc: { sessionVersion: 1 } },
+        { new: true, runValidators: true }
+      );
+      if (!updatedUser) {
+        return res.status(409).json({ message: "Your account changed during this request. Sign in again and retry." });
+      }
+
+      await LoginEmailChallenge.updateMany(
+        { userId: updatedUser._id, usedAt: null },
+        { $set: { usedAt: now } }
+      );
+      await SuperadminEmailChange.updateMany(
+        { userId: updatedUser._id, _id: { $ne: challenge._id }, usedAt: null },
+        { $set: { usedAt: now } }
+      );
+      try {
+        await sendSuperadminEmailChangedNotice({ to: consumed.currentEmail, name: updatedUser.name, newEmail: updatedUser.email });
+      } catch (error) {
+        console.error("superadmin old-email notice failed:", error?.message || error);
+      }
+
+      return res.json({ ok: true, email: updatedUser.email, message: "Email updated. Sign in again with your new email." });
+    } catch (err) {
+      if (err?.code === 11000) {
+        return res.status(409).json({ message: "That email address is already in use. Start again with another address." });
+      }
+      console.error("superadmin email change verification error:", err?.message || err);
+      return res.status(500).json({ message: "Unable to verify the code. Please try again." });
+    }
+  }
+);
+
+router.post(
+  "/admin/security/email-change/resend",
+  requireSystemAuth,
+  requireRole("superadmin"),
+  emailChangeResendIpLimit,
+  emailChangeResendChallengeLimit,
+  async (req, res) => {
+    try {
+      const challengeId = String(req.body?.challengeId || "").trim();
+      if (!mongoose.Types.ObjectId.isValid(challengeId)) {
+        return res.status(400).json({ message: "Email change request is invalid or expired. Start again." });
+      }
+      const now = new Date();
+      const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+      const challenge = await SuperadminEmailChange.findOneAndUpdate(
+        {
+          _id: challengeId,
+          userId: req.systemUser._id,
+          sessionVersion: Number(req.systemUser.sessionVersion || 0),
+          usedAt: null,
+          expiresAt: { $gt: now },
+          resendCount: { $lt: 2 },
+        },
+        {
+          $set: { codeHash: hashLoginCode(challengeId, code), expiresAt: new Date(Date.now() + 10 * 60 * 1000), attempts: 0 },
+          $inc: { resendCount: 1 },
+        },
+        { new: true }
+      );
+      if (!challenge) {
+        return res.status(429).json({ message: "Code resend limit reached or request expired. Start again later." });
+      }
+
+      try {
+        await sendSuperadminEmailChangeCode({
+          to: challenge.newEmail,
+          name: req.systemUser.name,
+          code,
+          newEmail: challenge.newEmail,
+          expiresMinutes: 10,
+        });
+      } catch (error) {
+        await SuperadminEmailChange.updateOne({ _id: challenge._id, usedAt: null }, { $set: { usedAt: new Date() } });
+        if (error?.code !== "SMTP_NOT_CONFIGURED") {
+          console.error("superadmin email change code resend failed:", error?.message || error);
+        }
+        return res.status(503).json({ message: "Unable to send the code. Please start the email change again later." });
+      }
+
+      return res.json({ email: maskedEmail(challenge.newEmail), expiresInMinutes: 10 });
+    } catch (err) {
+      console.error("superadmin email change resend error:", err?.message || err);
+      return res.status(500).json({ message: "Unable to resend the code. Please try again." });
+    }
+  }
+);
+
+router.post("/auth/forgot-password", recoveryIpLimit, recoveryAccountLimit, async (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
     const genericMessage =
@@ -479,7 +930,6 @@ router.post("/auth/forgot-password", async (req, res) => {
       { userId: user._id, usedAt: null },
       { $set: { usedAt: new Date() } }
     );
-
     const token = crypto.randomBytes(32).toString("hex");
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
     const resetUrl = publicResetUrl(req, token);
@@ -517,7 +967,7 @@ router.post("/auth/forgot-password", async (req, res) => {
   }
 });
 
-router.post("/auth/reset-password", async (req, res) => {
+router.post("/auth/reset-password", resetIpLimit, resetTokenLimit, async (req, res) => {
   try {
     const token = String(req.body?.token || "").trim();
     const password = String(req.body?.password || "");
@@ -545,12 +995,17 @@ router.post("/auth/reset-password", async (req, res) => {
     }
 
     user.password = password;
+    user.sessionVersion = Number(user.sessionVersion || 0) + 1;
     await user.save();
 
     tokenDoc.usedAt = new Date();
     await tokenDoc.save();
 
     await PasswordResetToken.updateMany(
+      { userId: user._id, usedAt: null },
+      { $set: { usedAt: new Date() } }
+    );
+    await LoginEmailChallenge.updateMany(
       { userId: user._id, usedAt: null },
       { $set: { usedAt: new Date() } }
     );
@@ -1119,7 +1574,7 @@ router.post(
   }
 );
 
-router.post("/register", async (req, res) => {
+router.post("/register", registrationIpLimit, async (req, res) => {
   try {
     const businessName = String(req.body?.businessName || req.body?.organizationName || "").trim();
     const ownerName = String(req.body?.ownerName || req.body?.name || "").trim();
@@ -1533,10 +1988,9 @@ router.patch(
     if (status === "suspended") organization.suspendedAt = new Date();
     await organization.save();
 
-    await SystemUser.updateMany(
-      { organizationId: organization._id },
-      { $set: { status: userStatusForOrganization(status) } }
-    );
+    const statusUpdate = { $set: { status: userStatusForOrganization(status) } };
+    if (status === "suspended") statusUpdate.$inc = { sessionVersion: 1 };
+    await SystemUser.updateMany({ organizationId: organization._id }, statusUpdate);
 
     if (status === "active") {
       await resolveNotifications({

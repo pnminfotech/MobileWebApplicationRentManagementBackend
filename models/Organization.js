@@ -139,6 +139,10 @@ const organizationSchema = new mongoose.Schema(
     phone: { type: String, trim: true, default: "" },
     address: { type: String, trim: true, default: "" },
     unitAllocation: { type: unitAllocationSchema, default: () => ({}) },
+    bedCategories: {
+      type: [String],
+      default: ["Standard", "Single",  "Bunk"],
+    },
     features: { type: featureSchema, default: () => ({}) },
     canteenSettings: { type: canteenSettingsSchema, default: () => ({}) },
     canteenSettingsHistory: {

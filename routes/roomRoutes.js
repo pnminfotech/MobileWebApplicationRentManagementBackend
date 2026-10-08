@@ -192,6 +192,7 @@ const express = require("express");
 const router = express.Router();
 const Room = require("../models/Room");
 const Form = require("../models/Form");
+const DEFAULT_BED_CATEGORIES = ["Standard", "Single",  "Bunk"];
 const authAdmin = require("../middleware/adminAuth");
 const { attachSystemAuthIfPresent } = require("../middleware/saasAuth");
 const { assertUnitCapacity, getUnitQuota } = require("../services/unitQuota");
@@ -216,8 +217,25 @@ function normalizeText(value) {
   return String(value || "").trim().replace(/\s+/g, " ");
 }
 
+function normalizeRoomCategory(value) {
+  return normalizeText(value)
+    .toLowerCase()
+    .replace(/(^|[\s-])([a-z])/g, (_, separator, letter) => `${separator}${letter.toUpperCase()}`);
+}
+
 function normalizeIdentifier(value) {
   return normalizeText(value).toUpperCase();
+}
+
+function normalizeBedCategories(values = []) {
+  const unique = new Map();
+  [...DEFAULT_BED_CATEGORIES, ...(Array.isArray(values) ? values : [])].forEach((value) => {
+    const name = normalizeText(value);
+    if (!name || name.length > 40) return;
+    const key = name.toLowerCase();
+    if (!unique.has(key)) unique.set(key, name);
+  });
+  return [...unique.values()];
 }
 
 function todayKey() {
@@ -397,6 +415,74 @@ router.put("/properties/rename", async (req, res) => {
     });
   }
 });
+
+router.get("/bed-categories", async (req, res) => {
+  try {
+    const rooms = await Room.find(scopedQuery(req, { isPlaceholder: { $ne: true } }))
+      .select("beds.bedCategory")
+      .lean();
+    const saved = req.organization?.bedCategories || req.admin?.bedCategories || [];
+    const fromUnits = rooms.flatMap((room) => (room.beds || []).map((bed) => bed.bedCategory));
+    res.json({ categories: normalizeBedCategories([...saved, ...fromUnits]) });
+  } catch (err) {
+    res.status(500).json({ message: "Unable to load bed categories." });
+  }
+});
+
+router.put("/bed-categories", async (req, res) => {
+  try {
+    if (!Array.isArray(req.body?.categories)) {
+      return res.status(400).json({ message: "Bed categories must be a list." });
+    }
+    const categories = normalizeBedCategories(req.body.categories);
+    if (categories.length > 50) {
+      return res.status(400).json({ message: "You can save up to 50 bed categories." });
+    }
+
+    const renameFrom = normalizeText(req.body?.renameFrom);
+    const renameTo = categories.find((item) => item.toLowerCase() !== renameFrom.toLowerCase() &&
+      item.toLowerCase() === normalizeText(req.body?.renameTo).toLowerCase());
+    if (renameFrom && renameTo && renameFrom.toLowerCase() !== renameTo.toLowerCase()) {
+      await Room.updateMany(
+        scopedQuery(req, { "beds.bedCategory": renameFrom }),
+        { $set: { "beds.$[bed].bedCategory": renameTo } },
+        { arrayFilters: [{ "bed.bedCategory": renameFrom }] }
+      );
+    }
+
+    if (req.organization) {
+      req.organization.bedCategories = categories;
+      await req.organization.save();
+    } else if (req.admin && typeof req.admin.save === "function") {
+      req.admin.bedCategories = categories;
+      await req.admin.save();
+    } else {
+      return res.status(403).json({ message: "Admin category settings are unavailable." });
+    }
+
+    res.json({ categories });
+  } catch (err) {
+    res.status(500).json({ message: "Unable to save bed categories." });
+  }
+});
+
+router.get("/room-categories", async (req, res) => {
+  try {
+    const rooms = await Room.find(scopedQuery(req, {
+      propertyType: "bed",
+      isPlaceholder: { $ne: true },
+      roomCategory: { $nin: [null, ""] },
+    })).select("roomCategory").lean();
+    const categories = [...new Map(rooms
+      .map((room) => normalizeRoomCategory(room.roomCategory))
+      .filter(Boolean)
+      .map((name) => [name.toLowerCase(), name])).values()];
+    res.json({ categories });
+  } catch (err) {
+    res.status(500).json({ message: "Unable to load room categories." });
+  }
+});
+
 router.get("/:roomId", async (req, res) => {
   try {
     const unit = await Room.findOne(scopedQuery(req, { _id: req.params.roomId })).lean();
@@ -420,6 +506,7 @@ router.post("/", async (req, res) => {
   try {
     const {
       category,
+      roomCategory,
       floorNo,
       roomNo,
       propertyType,
@@ -539,6 +626,7 @@ router.post("/", async (req, res) => {
       const [primaryPlaceholder, ...extraPlaceholders] = placeholders;
       const primaryPlaceholderCapacity = placeholderCapacity(primaryPlaceholder);
       primaryPlaceholder.category = cat;
+      primaryPlaceholder.roomCategory = normalizeRoomCategory(roomCategory);
       primaryPlaceholder.hasWing = normalizedHasWing;
       primaryPlaceholder.wingName = normalizedWingName;
       primaryPlaceholder.floorNo = flr;
@@ -569,6 +657,7 @@ router.post("/", async (req, res) => {
     const room = await Room.create(scopedCreate(req, {
       propertyType: normalizedPropertyType,
       category: cat,
+      roomCategory: normalizeRoomCategory(roomCategory),
       hasWing: normalizedHasWing,
       wingName: normalizedWingName,
       floorNo: flr,
@@ -950,11 +1039,12 @@ router.delete("/:roomId", requireSystemSecurityPin, async (req, res) => {
 // ✅ PUT /api/rooms/:roomId  -> update room category (and optionally floorNo/roomNo later)
 router.put("/:roomId", async (req, res) => {
   const { roomId } = req.params;
-  const { category, propertyType, floorNo, roomNo, hasWing, wingName, flatType, meterNo, lastMeterReading } = req.body || {};
+  const { category, roomCategory, propertyType, floorNo, roomNo, hasWing, wingName, flatType, meterNo, lastMeterReading } = req.body || {};
 
   try {
     if (
       !category &&
+      roomCategory === undefined &&
       propertyType === undefined &&
       floorNo === undefined &&
       roomNo === undefined &&
@@ -981,6 +1071,9 @@ router.put("/:roomId", async (req, res) => {
     const update = {};
     if (category && normalizeText(category)) {
       update.category = normalizeText(category);
+    }
+    if (roomCategory !== undefined) {
+      update.roomCategory = normalizeRoomCategory(roomCategory);
     }
     if (floorNo !== undefined && normalizeText(floorNo)) {
       update.floorNo = normalizeText(floorNo);
@@ -1049,6 +1142,7 @@ router.put("/:roomId", async (req, res) => {
           return res.status(400).json({ message: `Bed ${conflictingBed.bedNo} already exists in room ${nextLocation.roomNo}.` });
         }
         duplicateUnit.beds = [...(duplicateUnit.beds || []), ...incomingBeds];
+        if (update.roomCategory) duplicateUnit.roomCategory = update.roomCategory;
         if (update.meterNo) duplicateUnit.meterNo = update.meterNo;
         if (update.lastMeterReading !== undefined) duplicateUnit.lastMeterReading = update.lastMeterReading;
         await duplicateUnit.save();

@@ -713,7 +713,7 @@ async function handleMockSuccess(req, res) {
   try {
     const paymentProvider = String(process.env.PAYMENT_PROVIDER || "mock").toLowerCase();
 
-    if (paymentProvider !== "mock") {
+    if (process.env.NODE_ENV === "production" || paymentProvider !== "mock") {
       return res.status(403).json({ message: "Test payment completion is disabled" });
     }
 
@@ -754,7 +754,7 @@ router.post("/mock/success/:transactionId", handleMockSuccess);
 
 router.post("/mock/fail/:transactionId", async (req, res) => {
   try {
-    if (String(process.env.PAYMENT_PROVIDER || "mock").toLowerCase() !== "mock") {
+    if (process.env.NODE_ENV === "production" || String(process.env.PAYMENT_PROVIDER || "mock").toLowerCase() !== "mock") {
       return res.status(403).json({ message: "Mock payments are disabled" });
     }
 

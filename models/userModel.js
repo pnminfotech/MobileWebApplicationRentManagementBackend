@@ -39,6 +39,11 @@ const userSchema = new mongoose.Schema({
   parentPhoto: {
     type: String,
   },
+
+  bedCategories: {
+    type: [String],
+    default: ["Standard", "Single",  "Bunk"],
+  },
 });
 
 userSchema.pre("save", async function (next) {

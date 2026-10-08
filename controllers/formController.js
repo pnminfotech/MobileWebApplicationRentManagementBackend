@@ -410,12 +410,6 @@ const saveForm = async (req, res) => {
       }
     }
 
-    console.log(
-      "📥 Incoming payload to saveForm:",
-      JSON.stringify(payload, null, 2)
-    );
-    console.log("📂 Documents received:", payload.documents);
-
     const slotError = await validateTenantSlotAvailable(req, payload);
     if (slotError) {
       return res.status(slotError.status).json({ message: slotError.message });
@@ -730,7 +724,7 @@ const deleteForm = async (req, res) => {
   const { id } = req.params;
 
   try {
-    const expectedPassword = String(process.env.TENANT_DELETE_PASSWORD || "1234").trim();
+    const expectedPassword = String(process.env.TENANT_DELETE_PASSWORD || "").trim();
     const suppliedPassword = String(req.body?.password || req.get("X-Delete-Password") || "").trim();
 
     if (req.systemUser?.role === "system_admin") {
