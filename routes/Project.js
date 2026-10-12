@@ -11,7 +11,25 @@ const authAdmin = require("../middleware/adminAuth");
 const requireLegacyDataAccess = require("../middleware/requireLegacyDataAccess");
 
 router.use(authAdmin);
-router.use(requireLegacyDataAccess);
+router.use((req, res, next) => {
+  const path = req.path || "";
+  const legacyProjectPrefixes = [
+    "/emp/projects",
+    "/projects",
+    "/projectEmpayment",
+    "/projectSpayment",
+    "/project",
+  ];
+  const isLegacyProjectRoute = legacyProjectPrefixes.some(
+    (prefix) => path === prefix || path.startsWith(`${prefix}/`)
+  );
+
+  if (isLegacyProjectRoute) {
+    return requireLegacyDataAccess(req, res, next);
+  }
+
+  return next();
+});
 
 const ImageKit = require("imagekit");
 
