@@ -346,15 +346,9 @@ firstRentMonth: body.firstRentMonth,
       }
 
       if (docs.length) {
-        // Replace docs by relation on edit to avoid duplicates/wrong labels
-        const incomingRelations = new Set(
-          docs.map((d) => String(d?.relation || "Document").trim())
-        );
-        const filteredExisting = (existing.documents || []).filter((d) => {
-          const rel = String(d?.relation || "Document").trim();
-          return !incomingRelations.has(rel);
-        });
-        existing.documents = [...filteredExisting, ...docs];
+        // Keep every saved document. Admins can remove a specific document
+        // from the edit screen when it is no longer needed.
+        existing.documents = [...(existing.documents || []), ...docs];
       }
 
       await existing.save();

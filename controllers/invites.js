@@ -941,6 +941,11 @@ exports.validateInvite = async (req, res) => {
         prefill[key] = existingForm[key];
       }
     }
+    // The draft is the source of truth for an admin-set deposit. This also
+    // repairs older invite records that retained a stale zero.
+    if (Number(prefill.depositAmount) === 0 && Number(existingForm?.depositAmount) > 0) {
+      prefill.depositAmount = existingForm.depositAmount;
+    }
     prefill.propertyType = await inferInvitePropertyType(
       { ...existingFormValues, ...prefill },
       invDoc.organizationId

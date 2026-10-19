@@ -231,7 +231,6 @@ function getFirstBillYM(tenant = {}, joinDateValue = null) {
   const joinDate = toValidDate(joinDateValue) || toValidDate(tenant.joiningDate);
   if (!joinDate) return null;
 
-  const isAdvance = String(tenant.firstRentStatus || "").trim() === "ADVANCE_PAID";
   const joinYM = joinDate.getFullYear() * 12 + joinDate.getMonth();
 
   if (!tenant.firstRentMonth) return joinYM;
@@ -240,8 +239,12 @@ function getFirstBillYM(tenant = {}, joinDateValue = null) {
   if (!parsed) return null;
 
   const parsedYM = parsed.y * 12 + parsed.m;
-  const legacyNormalPaymentMonth = !isAdvance && parsedYM === joinYM + 1;
-  return legacyNormalPaymentMonth ? joinYM : parsedYM;
+  // firstRentMonth is the month in which the cycle becomes payable. A normal
+  // tenant joining on 24 Aug therefore has their first cycle (24 Aug–24 Sep)
+  // under Sep-26. Keeping it under Aug-26 made the September calculation use
+  // the following Sep–Oct cycle, which let a later room shift alter the amount
+  // displayed for the completed August–September period.
+  return parsedYM;
 }
 
 function buildRentTimeline(tenant = {}, roomsData = []) {

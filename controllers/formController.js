@@ -727,14 +727,15 @@ const deleteForm = async (req, res) => {
     const expectedPassword = String(process.env.TENANT_DELETE_PASSWORD || "").trim();
     const suppliedPassword = String(req.body?.password || req.get("X-Delete-Password") || "").trim();
 
-    if (req.systemUser?.role === "system_admin") {
+    const isSystemAdmin = ["system_admin", "systemadmin"].includes(String(req.systemUser?.role || "").toLowerCase());
+    if (isSystemAdmin) {
       const securityPin = String(req.body?.securityPin || "").trim();
       const user = await SystemUser.findById(req.systemUser._id).select("+securityPin");
       if (!user?.securityPin) return res.status(428).json({ message: "Set up your security PIN before deleting a tenant." });
       if (!(await user.compareSecurityPin(securityPin))) return res.status(403).json({ message: "Incorrect security PIN." });
     }
 
-    if (req.systemUser?.role !== "system_admin" && (!suppliedPassword || suppliedPassword !== expectedPassword)) {
+    if (!isSystemAdmin && (!suppliedPassword || suppliedPassword !== expectedPassword)) {
       return res.status(403).json({ message: "Invalid delete password" });
     }
 

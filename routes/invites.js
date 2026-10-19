@@ -35,8 +35,10 @@ function normalizeDocumentRelation(value) {
     "parent relative aadhaar": "parent aadhaar card",
     "partner aadhaar": "partner aadhaar card",
     "tenant photograph": "tenant photo",
-    "tenant photograph (selfie)": "tenant photograph (selfie)",
+    "tenant photograph (selfie)": "tenant photo",
     photo: "tenant photo",
+    pan: "pan card",
+    "shop pan": "pan card",
   };
   return aliases[relation] || relation;
 }
@@ -46,8 +48,8 @@ function canonicalDocumentRelation(value) {
   if (relation === "self aadhaar card") return "Self Aadhaar Card";
   if (relation === "parent aadhaar card") return "Parent Aadhaar Card";
   if (relation === "partner aadhaar card") return "Partner Aadhaar Card";
-  if (relation === "tenant photograph (selfie)") return "Tenant Photograph (Selfie)";
   if (relation === "tenant photo") return "Tenant Photo";
+  if (relation === "pan card") return "PAN Card";
   return String(value || "").trim();
 }
 
@@ -139,6 +141,12 @@ async function submitInviteForm(req, res) {
       return res.status(404).json({ ok: false, message: "Tenant draft not found" });
     }
 
+    // A few older mobile invites retained a zero in their prefill although
+    // the linked draft already held the amount entered by the admin.
+    if (Number(lockedValues.depositAmount) === 0 && Number(existingForm.depositAmount) > 0) {
+      lockedValues.depositAmount = Number(existingForm.depositAmount);
+    }
+
     const propertyType = await inferPropertyTypeFromRoom({ ...existingForm, ...(inv.prefill || {}) }, inv.organizationId);
     const isResidentialRoom = propertyType === "room";
     const isShop = propertyType === "shop";
@@ -185,14 +193,25 @@ async function submitInviteForm(req, res) {
     const existingDocuments = Array.isArray(existingForm.documents) ? existingForm.documents : [];
     const relations = new Set([...existingDocuments, ...documents].map((document) => normalizeDocumentRelation(document?.relation)));
     const requiredDocumentRelations = isResidentialRoom
-      ? ["self aadhaar card", "partner aadhaar card", "tenant photograph (selfie)"]
+      ? ["self aadhaar card", "partner aadhaar card", "tenant photo"]
       : isShop
-      ? ["self aadhaar card", "tenant photograph (selfie)"]
+      ? ["self aadhaar card", "tenant photo", "pan card"]
       : ["self aadhaar card", "parent aadhaar card", "tenant photo"];
 
-    if (!requiredDocumentRelations.every((relation) => relations.has(relation))) {
+    const missingDocumentRelations = requiredDocumentRelations.filter((relation) => !relations.has(relation));
+    if (missingDocumentRelations.length) {
       await releaseInvite();
-      return res.status(400).json({ ok: false, message: "All required tenant documents are required" });
+      const documentLabels = {
+        "self aadhaar card": "Self Aadhaar Card",
+        "parent aadhaar card": "Parent Aadhaar Card",
+        "partner aadhaar card": "Partner Aadhaar Card",
+        "tenant photo": "Tenant Photograph (Selfie)",
+        "pan card": "PAN Card",
+      };
+      return res.status(400).json({
+        ok: false,
+        message: `Please upload: ${missingDocumentRelations.map((relation) => documentLabels[relation] || relation).join(", ")}.`,
+      });
     }
 
     if (documents.length) {

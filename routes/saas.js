@@ -58,7 +58,7 @@ const {
 } = require("../services/walletService");
 const {
   sendPasswordResetEmail,
-  sendSuperadminLoginCode,
+  sendLoginEmailCode,
   sendSuperadminEmailChangeCode,
   sendSuperadminEmailChangedNotice,
 } = require("../services/emailService");
@@ -94,6 +94,8 @@ const loginCodeVerifyIpLimit = createAuthRateLimit({ name: "login-code-verify-ip
 const loginCodeVerifyChallengeLimit = createAuthRateLimit({ name: "login-code-verify-challenge", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: challengeIdentifier });
 const loginCodeResendIpLimit = createAuthRateLimit({ name: "login-code-resend-ip", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
 const loginCodeResendChallengeLimit = createAuthRateLimit({ name: "login-code-resend-challenge", windowMs: 15 * 60 * 1000, max: 2, keyFromRequest: challengeIdentifier, countSuccessfulRequests: true });
+const loginPinVerifyIpLimit = createAuthRateLimit({ name: "login-pin-verify-ip", windowMs: 15 * 60 * 1000, max: 10, keyFromRequest: requestIp });
+const loginPinVerifyChallengeLimit = createAuthRateLimit({ name: "login-pin-verify-challenge", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: challengeIdentifier });
 const emailChangeStartIpLimit = createAuthRateLimit({ name: "superadmin-email-change-start-ip", windowMs: 60 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
 const emailChangeStartAccountLimit = createAuthRateLimit({ name: "superadmin-email-change-start-account", windowMs: 60 * 60 * 1000, max: 3, keyFromRequest: (req) => String(req.systemUser?._id || ""), countSuccessfulRequests: true });
 const emailChangeVerifyIpLimit = createAuthRateLimit({ name: "superadmin-email-change-verify-ip", windowMs: 15 * 60 * 1000, max: 10, keyFromRequest: requestIp });
@@ -169,7 +171,7 @@ function maskedEmail(email) {
 
 async function deliverSuperadminLoginCode(user, challengeId, code) {
   try {
-    await sendSuperadminLoginCode({ to: user.email, name: user.name, code, expiresMinutes: 10 });
+    await sendLoginEmailCode({ to: user.email, name: user.name, code, expiresMinutes: 10 });
     return true;
   } catch (error) {
     await LoginEmailChallenge.updateOne(
@@ -177,10 +179,53 @@ async function deliverSuperadminLoginCode(user, challengeId, code) {
       { $set: { usedAt: new Date() } }
     );
     if (error?.code !== "SMTP_NOT_CONFIGURED") {
-      console.error("superadmin login code email delivery failed:", error?.message || error);
+      console.error("login code email delivery failed:", error?.message || error);
     }
     return false;
   }
+}
+
+async function startEmailLoginChallenge(req, res) {
+  const login = String(req.body?.email || req.body?.loginId || "").trim().toLowerCase();
+  if (!login) {
+    return res.status(400).json({ message: "Email is required." });
+  }
+
+  const user = await SystemUser.findOne({
+    $or: [{ email: login }, { loginId: login }],
+  });
+  if (!user) return res.status(400).json({ message: "No account was found for this email." });
+  if (user.status === "suspended") return res.status(403).json({ message: "Account suspended" });
+
+  if (!passRateLimits(req, res, [loginCodeSendIpLimit, loginCodeSendAccountLimit])) return null;
+
+  await LoginEmailChallenge.updateMany(
+    { userId: user._id, usedAt: null },
+    { $set: { usedAt: new Date() } }
+  );
+
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+  const challengeId = new mongoose.Types.ObjectId();
+  const challenge = await LoginEmailChallenge.create({
+    _id: challengeId,
+    userId: user._id,
+    sessionVersion: Number(user.sessionVersion || 0),
+    clientPlatform: String(req.get("X-Platform") || "web").toLowerCase() === "mobile" ? "mobile" : "web",
+    codeHash: hashLoginCode(challengeId, code),
+    expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+  });
+
+  const delivered = await deliverSuperadminLoginCode(user, challenge._id, code);
+  if (!delivered) {
+    return res.status(503).json({ message: "Unable to send the verification code. Check the server email settings or contact support." });
+  }
+
+  return res.json({
+    requiresEmailCode: true,
+    challengeId: String(challenge._id),
+    email: maskedEmail(user.email),
+    expiresInMinutes: 10,
+  });
 }
 
 function publicResetUrl(req, token) {
@@ -195,6 +240,21 @@ function publicResetUrl(req, token) {
   const url = new URL("/reset-password", origin);
   url.searchParams.set("token", token);
   return url.toString();
+}
+
+async function completeLoginFromChallenge(challenge, user, res) {
+  const now = new Date();
+  const consumed = await LoginEmailChallenge.findOneAndUpdate(
+    { _id: challenge._id, userId: user._id, usedAt: null, expiresAt: { $gt: now } },
+    { $set: { usedAt: now } },
+    { new: true }
+  );
+  if (!consumed) return res.status(400).json({ message: "Sign-in request expired. Please start again." });
+
+  user.lastLoginAt = now;
+  if (consumed.clientPlatform !== "mobile") user.lastWebActivityAt = now;
+  await user.save();
+  return res.json({ token: signSystemToken(user, consumed.clientPlatform), user: publicUser(user), organization: null });
 }
 
 async function uniqueSlug(name) {
@@ -581,6 +641,15 @@ router.post("/auth/login", loginIpLimit, loginAccountLimit, async (req, res) => 
   }
 });
 
+router.post("/auth/login/request-email-code", loginIpLimit, loginAccountLimit, async (req, res) => {
+  try {
+    return await startEmailLoginChallenge(req, res);
+  } catch (err) {
+    console.error("email login request error:", err?.message || err);
+    return res.status(500).json({ message: "Unable to send the verification code. Please try again." });
+  }
+});
+
 router.post("/auth/login/verify-email", loginCodeVerifyIpLimit, loginCodeVerifyChallengeLimit, async (req, res) => {
   try {
     const challengeId = String(req.body?.challengeId || "").trim();
@@ -593,6 +662,7 @@ router.post("/auth/login/verify-email", loginCodeVerifyIpLimit, loginCodeVerifyC
     const challenge = await LoginEmailChallenge.findOne({
       _id: challengeId,
       usedAt: null,
+      emailVerifiedAt: null,
       expiresAt: { $gt: now },
       attempts: { $lt: 5 },
     });
@@ -613,7 +683,7 @@ router.post("/auth/login/verify-email", loginCodeVerifyIpLimit, loginCodeVerifyC
       return res.status(400).json({ message: "The code is incorrect or expired." });
     }
 
-    const consumed = await LoginEmailChallenge.findOneAndUpdate(
+    const verifiedChallenge = await LoginEmailChallenge.findOneAndUpdate(
       {
         _id: challenge._id,
         codeHash: expectedHash,
@@ -621,33 +691,118 @@ router.post("/auth/login/verify-email", loginCodeVerifyIpLimit, loginCodeVerifyC
         expiresAt: { $gt: now },
         attempts: { $lt: 5 },
       },
-      { $set: { usedAt: now }, $inc: { attempts: 1 } },
+      { $set: { emailVerifiedAt: now }, $inc: { attempts: 1 } },
       { new: true }
     );
-    if (!consumed) {
+    if (!verifiedChallenge) {
       return res.status(400).json({ message: "The code is invalid or expired. Request a new code and try again." });
     }
 
-    const user = await SystemUser.findById(consumed.userId);
-    if (!user || user.role !== "superadmin") {
+    const user = await SystemUser.findById(verifiedChallenge.userId).select("+securityPin");
+    if (!user) {
       return res.status(400).json({ message: "Unable to complete sign-in. Please start again." });
     }
-    if (Number(user.sessionVersion || 0) !== Number(consumed.sessionVersion)) {
+    if (Number(user.sessionVersion || 0) !== Number(verifiedChallenge.sessionVersion)) {
       return res.status(400).json({ message: "Your account changed during sign-in. Please start again." });
     }
     if (user.status === "suspended") {
       return res.status(403).json({ message: "Account suspended" });
     }
 
-    user.lastLoginAt = new Date();
-    if (consumed.clientPlatform !== "mobile") {
-      user.lastWebActivityAt = user.lastLoginAt;
+    if (user.role === "superadmin") {
+      return res.json({
+        requiresSecurityPin: Boolean(user.securityPin),
+        requiresSecurityPinSetup: !user.securityPin,
+        challengeId: String(verifiedChallenge._id),
+      });
     }
-    await user.save();
-    res.json({ token: signSystemToken(user, consumed.clientPlatform), user: publicUser(user), organization: null });
+    return completeLoginFromChallenge(verifiedChallenge, user, res);
   } catch (err) {
-    console.error("superadmin email verification error:", err?.message || err);
+    console.error("email login verification error:", err?.message || err);
     res.status(500).json({ message: "Unable to verify the code. Please try again." });
+  }
+});
+
+router.post("/auth/login/verify-security-pin", loginPinVerifyIpLimit, loginPinVerifyChallengeLimit, async (req, res) => {
+  try {
+    const challengeId = String(req.body?.challengeId || "").trim();
+    const pin = String(req.body?.pin || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(challengeId) || !/^\d{4,8}$/.test(pin)) {
+      return res.status(400).json({ message: "Enter a valid security PIN." });
+    }
+    const now = new Date();
+    const challenge = await LoginEmailChallenge.findOne({ _id: challengeId, usedAt: null, emailVerifiedAt: { $ne: null }, expiresAt: { $gt: now } });
+    if (!challenge) return res.status(400).json({ message: "Sign-in request expired. Please start again." });
+    const user = await SystemUser.findById(challenge.userId).select("+securityPin");
+    if (!user || user.role !== "superadmin" || user.status === "suspended" || Number(user.sessionVersion || 0) !== Number(challenge.sessionVersion)) {
+      return res.status(400).json({ message: "Sign-in request expired. Please start again." });
+    }
+    if (!user.securityPin) return res.status(428).json({ message: "Set up your security PIN to finish signing in." });
+    if (user.securityPinLockedUntil && user.securityPinLockedUntil > now) {
+      return res.status(429).json({ message: "Security PIN is temporarily locked. Try again in 15 minutes." });
+    }
+    if (!(await user.compareSecurityPin(pin))) {
+      const attempts = Number(user.securityPinLoginAttempts || 0) + 1;
+      user.securityPinLoginAttempts = attempts >= 5 ? 0 : attempts;
+      user.securityPinLockedUntil = attempts >= 5 ? new Date(Date.now() + 15 * 60 * 1000) : null;
+      await user.save();
+      return res.status(attempts >= 5 ? 429 : 400).json({ message: attempts >= 5 ? "Too many incorrect PIN attempts. Try again in 15 minutes." : "Incorrect security PIN." });
+    }
+    user.securityPinLoginAttempts = 0;
+    user.securityPinLockedUntil = null;
+    return completeLoginFromChallenge(challenge, user, res);
+  } catch (err) {
+    console.error("security PIN login verification error:", err?.message || err);
+    return res.status(500).json({ message: "Unable to verify the security PIN. Please try again." });
+  }
+});
+
+router.post("/auth/login/setup-security-pin", loginPinVerifyIpLimit, loginPinVerifyChallengeLimit, async (req, res) => {
+  try {
+    const challengeId = String(req.body?.challengeId || "").trim();
+    const pin = String(req.body?.pin || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(challengeId) || !/^\d{4,8}$/.test(pin)) return res.status(400).json({ message: "PIN must contain 4 to 8 digits." });
+    const now = new Date();
+    const challenge = await LoginEmailChallenge.findOne({ _id: challengeId, usedAt: null, emailVerifiedAt: { $ne: null }, expiresAt: { $gt: now } });
+    if (!challenge) return res.status(400).json({ message: "Sign-in request expired. Please start again." });
+    const user = await SystemUser.findById(challenge.userId).select("+securityPin");
+    if (!user || user.role !== "superadmin" || user.securityPin) return res.status(400).json({ message: "Security PIN setup is no longer available. Please sign in again." });
+    user.securityPin = await bcrypt.hash(pin, 10);
+    user.securityPinLoginAttempts = 0;
+    user.securityPinLockedUntil = null;
+    return completeLoginFromChallenge(challenge, user, res);
+  } catch (err) {
+    console.error("security PIN login setup error:", err?.message || err);
+    return res.status(500).json({ message: "Unable to set the security PIN. Please try again." });
+  }
+});
+
+router.post("/auth/login/reset-security-pin", loginPinVerifyIpLimit, loginPinVerifyChallengeLimit, async (req, res) => {
+  try {
+    const challengeId = String(req.body?.challengeId || "").trim();
+    const pin = String(req.body?.pin || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(challengeId) || !/^\d{4,8}$/.test(pin)) {
+      return res.status(400).json({ message: "PIN must contain 4 to 8 digits." });
+    }
+    const now = new Date();
+    const challenge = await LoginEmailChallenge.findOne({
+      _id: challengeId,
+      usedAt: null,
+      emailVerifiedAt: { $ne: null },
+      expiresAt: { $gt: now },
+    });
+    if (!challenge) return res.status(400).json({ message: "Sign-in request expired. Please start again." });
+    const user = await SystemUser.findById(challenge.userId).select("+securityPin");
+    if (!user || user.role !== "superadmin" || user.status === "suspended" || Number(user.sessionVersion || 0) !== Number(challenge.sessionVersion)) {
+      return res.status(400).json({ message: "Sign-in request expired. Please start again." });
+    }
+    user.securityPin = await bcrypt.hash(pin, 10);
+    user.securityPinLoginAttempts = 0;
+    user.securityPinLockedUntil = null;
+    return completeLoginFromChallenge(challenge, user, res);
+  } catch (err) {
+    console.error("security PIN login reset error:", err?.message || err);
+    return res.status(500).json({ message: "Unable to reset the security PIN. Please try again." });
   }
 });
 
@@ -668,7 +823,7 @@ router.post("/auth/login/resend-email-code", loginCodeResendIpLimit, loginCodeRe
     }
 
     const user = await SystemUser.findById(challenge.userId);
-    if (!user || user.role !== "superadmin" || user.status === "suspended") {
+    if (!user || user.status === "suspended") {
       return res.status(400).json({ message: "Sign-in challenge is invalid or expired. Please sign in again." });
     }
     if (Number(user.sessionVersion || 0) !== Number(challenge.sessionVersion)) {
@@ -681,7 +836,7 @@ router.post("/auth/login/resend-email-code", loginCodeResendIpLimit, loginCodeRe
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
     const updatedChallenge = await LoginEmailChallenge.findOneAndUpdate(
       { _id: challenge._id, usedAt: null, expiresAt: { $gt: now }, resendCount: { $lt: 2 } },
-      { $set: { codeHash: hashLoginCode(challenge._id, code), expiresAt, attempts: 0 }, $inc: { resendCount: 1 } },
+      { $set: { codeHash: hashLoginCode(challenge._id, code), expiresAt, attempts: 0, emailVerifiedAt: null }, $inc: { resendCount: 1 } },
       { new: true }
     );
     if (!updatedChallenge) {
@@ -2395,6 +2550,55 @@ router.post(
     } catch (err) {
       console.error("migration assign error:", err);
       res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+router.get(
+  "/settings/hostel-rules",
+  requireSystemAuth,
+  requireRole("system_admin"),
+  requireActiveOrganization,
+  async (req, res) => {
+    const rules = req.organization?.hostelRules || {};
+    res.json({
+      title: rules.title || "Hostel Rules & Regulations",
+      content: rules.content || "",
+      updatedAt: rules.updatedAt || null,
+    });
+  }
+);
+
+router.put(
+  "/settings/hostel-rules",
+  requireSystemAuth,
+  requireRole("system_admin"),
+  requireActiveOrganization,
+  async (req, res) => {
+    try {
+      const title = String(req.body?.title || "Hostel Rules & Regulations").trim();
+      const content = String(req.body?.content || "").trim();
+
+      if (title.length > 120 || content.length > 12000) {
+        return res.status(400).json({ message: "Rules title or content is too long." });
+      }
+
+      req.organization.hostelRules = {
+        title: title || "Hostel Rules & Regulations",
+        content,
+        updatedAt: new Date(),
+      };
+      await req.organization.save();
+
+      res.json({
+        message: "Hostel rules saved.",
+        title: req.organization.hostelRules.title,
+        content: req.organization.hostelRules.content,
+        updatedAt: req.organization.hostelRules.updatedAt,
+      });
+    } catch (err) {
+      console.error("save hostel rules error:", err);
+      res.status(500).json({ message: "Unable to save hostel rules." });
     }
   }
 );

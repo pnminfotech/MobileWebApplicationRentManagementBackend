@@ -29,7 +29,10 @@ function deriveFirstRentMonth(joiningDate, firstRentStatus) {
   const joinDate = toValidDate(joiningDate);
   if (!joinDate) return "";
 
-  return fmtMonthKey(new Date(joinDate.getFullYear(), joinDate.getMonth(), 1));
+  const isAdvance = String(firstRentStatus || "").trim() === "ADVANCE_PAID";
+  return fmtMonthKey(
+    new Date(joinDate.getFullYear(), joinDate.getMonth() + (isAdvance ? 0 : 1), 1)
+  );
 }
 
 function isFirstRentCycleEditable(existing = {}) {

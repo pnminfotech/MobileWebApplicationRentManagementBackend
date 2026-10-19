@@ -90,6 +90,36 @@ async function trySystemAdminAuth(token, req, res, next) {
 
 module.exports = async function adminAuth(req, res, next) {
   try {
+    // attachSystemAuthIfPresent has already verified this SaaS token, session,
+    // organization, and subscription for routes that use both middlewares.
+    if (req.systemUser) {
+      const user = req.systemUser;
+      const organization = req.organization;
+
+      if (user.role !== 'system_admin') {
+        return res.status(403).json({ message: 'System admin access required' });
+      }
+      if (!organization) {
+        return res.status(403).json({ message: 'Organization required' });
+      }
+      if (organization.status !== 'active') {
+        return res.status(402).json({
+          message: 'Subscription payment required',
+          organizationStatus: organization.status,
+        });
+      }
+
+      req.admin = {
+        id: user._id,
+        _id: user._id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        organizationId: organization._id,
+      };
+      return next();
+    }
+
     const auth = req.headers.authorization || '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
     if (!token) {

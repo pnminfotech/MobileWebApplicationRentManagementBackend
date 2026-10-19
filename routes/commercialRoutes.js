@@ -6,6 +6,7 @@ const Form = require("../models/Form");
 const authAdmin = require("../middleware/adminAuth");
 const { attachSystemAuthIfPresent } = require("../middleware/saasAuth");
 const { scopedQuery, scopedCreate, scopedUpdate } = require("../utils/organizationScope");
+const { requireSystemSecurityPin } = require("../middleware/securityPin");
 
 router.use(attachSystemAuthIfPresent);
 router.use(authAdmin);
@@ -104,7 +105,7 @@ router.put("/:unitId", async (req, res) => {
   }
 });
 
-router.delete("/:unitId", async (req, res) => {
+router.delete("/:unitId", requireSystemSecurityPin, async (req, res) => {
   try {
     const { unitId } = req.params;
     const unit = await CommercialUnit.findOne(scopedQuery(req, { _id: unitId }));

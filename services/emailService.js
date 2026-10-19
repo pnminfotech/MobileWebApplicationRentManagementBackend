@@ -59,7 +59,7 @@ async function sendPasswordResetEmail({ to, name, resetUrl, expiresMinutes = 15 
   });
 }
 
-async function sendSuperadminLoginCode({ to, name, code, expiresMinutes = 10 }) {
+async function sendLoginEmailCode({ to, name, code, expiresMinutes = 10 }) {
   const transporter = getTransporter();
   if (!transporter) {
     const error = new Error("SMTP is not configured");
@@ -73,17 +73,20 @@ async function sendSuperadminLoginCode({ to, name, code, expiresMinutes = 10 }) 
   await transporter.sendMail({
     from,
     to,
-    subject: `${appName} superadmin sign-in code`,
+    subject: `${appName} sign-in code`,
     text: [
-      `Hello ${name || "Superadmin"},`,
+      `Hello ${name || "there"},`,
       "",
-      `Your superadmin sign-in code is: ${code}`,
+      `Your sign-in code is: ${code}`,
       `It expires in ${expiresMinutes} minutes and can only be used once.`,
       "",
       "If you did not try to sign in, change your password and secure your email account.",
     ].join("\n"),
   });
 }
+
+// Kept for the existing security settings flow while sign-in uses the neutral name above.
+const sendSuperadminLoginCode = sendLoginEmailCode;
 
 async function sendSuperadminEmailChangeCode({ to, name, code, newEmail, expiresMinutes = 10 }) {
   const transporter = getTransporter();
@@ -151,6 +154,7 @@ module.exports = {
   hasSmtpConfig,
   sendBasicEmail,
   sendPasswordResetEmail,
+  sendLoginEmailCode,
   sendSuperadminLoginCode,
   sendSuperadminEmailChangeCode,
   sendSuperadminEmailChangedNotice,

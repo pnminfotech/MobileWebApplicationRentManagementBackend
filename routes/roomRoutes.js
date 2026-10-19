@@ -196,6 +196,7 @@ const DEFAULT_BED_CATEGORIES = ["Standard", "Single",  "Bunk"];
 const authAdmin = require("../middleware/adminAuth");
 const { attachSystemAuthIfPresent } = require("../middleware/saasAuth");
 const { assertUnitCapacity, getUnitQuota } = require("../services/unitQuota");
+const { repairDuplicateRoomBeds } = require("../services/roomBedRepair");
 const { requireSystemSecurityPin } = require("../middleware/securityPin");
 const {
   scopedQuery,
@@ -276,6 +277,7 @@ function activeTenantQueryForUnit(room) {
 
 router.get("/", async (req, res) => {
   try {
+    await repairDuplicateRoomBeds(scopedQuery(req));
     if (req.organizationId) {
       await getUnitQuota(req.organizationId);
     }
@@ -288,6 +290,7 @@ router.get("/", async (req, res) => {
 
 router.get("/usage", async (req, res) => {
   try {
+    await repairDuplicateRoomBeds(scopedQuery(req));
     const quota = await getUnitQuota(req.organizationId);
     res.json(quota);
   } catch (err) {
@@ -485,6 +488,7 @@ router.get("/room-categories", async (req, res) => {
 
 router.get("/:roomId", async (req, res) => {
   try {
+    await repairDuplicateRoomBeds(scopedQuery(req, { _id: req.params.roomId }));
     const unit = await Room.findOne(scopedQuery(req, { _id: req.params.roomId })).lean();
     if (!unit) return res.status(404).json({ message: "Unit not found" });
 

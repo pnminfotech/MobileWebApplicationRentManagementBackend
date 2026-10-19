@@ -14,6 +14,7 @@ const loginEmailChallengeSchema = new mongoose.Schema(
     expiresAt: { type: Date, required: true },
     attempts: { type: Number, default: 0 },
     resendCount: { type: Number, default: 0 },
+    emailVerifiedAt: { type: Date, default: null },
     usedAt: { type: Date, default: null },
   },
   { timestamps: true }

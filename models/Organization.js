@@ -125,6 +125,15 @@ const lightBillSettingsSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const hostelRulesSchema = new mongoose.Schema(
+  {
+    title: { type: String, trim: true, default: "Hostel Rules & Regulations", maxlength: 120 },
+    content: { type: String, trim: true, default: "", maxlength: 12000 },
+    updatedAt: { type: Date, default: null },
+  },
+  { _id: false }
+);
+
 const organizationSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
@@ -150,6 +159,7 @@ const organizationSchema = new mongoose.Schema(
       default: [],
     },
     lightBillSettings: { type: lightBillSettingsSchema, default: () => ({}) },
+    hostelRules: { type: hostelRulesSchema, default: () => ({}) },
     status: {
       type: String,
       enum: ["pending_payment", "active", "suspended", "expired", "cancelled"],

@@ -16,6 +16,8 @@ const systemUserSchema = new mongoose.Schema(
     password: { type: String, required: true, select: false },
     // Separate short PIN used only to confirm high-risk Super Admin actions.
     securityPin: { type: String, select: false, default: null },
+    securityPinLoginAttempts: { type: Number, default: 0 },
+    securityPinLockedUntil: { type: Date, default: null },
     role: {
       type: String,
       enum: ["superadmin", "system_admin"],

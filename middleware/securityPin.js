@@ -1,7 +1,7 @@
 const SystemUser = require("../models/SystemUser");
 
 async function requireSystemSecurityPin(req, res, next) {
-  if (req.systemUser?.role !== "system_admin") return next();
+  if (!["system_admin", "systemadmin"].includes(String(req.systemUser?.role || "").toLowerCase())) return next();
   const pin = String(req.body?.securityPin || "").trim();
   if (!/^\d{4,8}$/.test(pin)) return res.status(400).json({ message: "Enter your 4 to 8 digit security PIN." });
   try {

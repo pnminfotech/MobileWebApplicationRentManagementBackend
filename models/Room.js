@@ -1,5 +1,6 @@
 // models/Room.js
 const mongoose = require("mongoose");
+const { uniqueRoomBeds } = require("../utils/roomBeds");
 
 const BedSchema = new mongoose.Schema(
   {
@@ -35,7 +36,12 @@ const RoomSchema = new mongoose.Schema(
     beds: { type: [BedSchema], default: [] },
     isPlaceholder: { type: Boolean, default: false, index: true },
   },
-  { timestamps: true }
+  { timestamps: true, optimisticConcurrency: true }
+);
+
+RoomSchema.path("beds").validate(
+  (beds) => Array.isArray(beds) && uniqueRoomBeds(beds).length === beds.length,
+  "Bed numbers must be unique within a room"
 );
 
 RoomSchema.index({
