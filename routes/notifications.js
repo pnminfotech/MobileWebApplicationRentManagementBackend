@@ -266,6 +266,18 @@ router.patch("/notifications/:id/resolve", requireSystemAuth, async (req, res) =
   }
 });
 
+router.patch("/notifications/resolve-all", requireSystemAuth, async (req, res) => {
+  try {
+    const result = await Notification.updateMany(
+      activeNotificationScope(req),
+      { $set: { read: true, status: "resolved", resolvedAt: new Date() } }
+    );
+    res.json({ modifiedCount: result.modifiedCount || 0 });
+  } catch (err) {
+    res.status(500).json({ message: "Unable to dismiss notifications" });
+  }
+});
+
 router.use(attachSystemAuthIfPresent);
 
 // =======================

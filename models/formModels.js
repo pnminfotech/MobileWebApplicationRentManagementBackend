@@ -262,6 +262,17 @@ firstRentMonth: { type: String }, // e.g. "Jan-26"
     },
 
     leaveDate: { type: String },
+    unitRemoval: {
+      removedAt: { type: Date, default: null },
+      effectiveDate: { type: String, default: "" },
+      propertyType: { type: String, default: "" },
+      unitId: { type: String, default: "" },
+      roomNo: { type: String, default: "" },
+      bedNo: { type: String, default: "" },
+      label: { type: String, default: "" },
+      reason: { type: String, default: "" },
+      removedBy: { type: String, default: "" },
+    },
     leaveSettlement: {
       deductFromDeposit: { type: Boolean, default: false },
       selectedMonths: [{ type: String }],

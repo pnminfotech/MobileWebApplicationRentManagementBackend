@@ -1393,6 +1393,43 @@ router.post(
   }
 );
 
+router.post("/subscription/unit-reduction-request", requireSystemAuth, async (req, res) => {
+  try {
+    if (req.systemUser.role === "superadmin") {
+      return res.status(400).json({ message: "Superadmin cannot request a unit reduction" });
+    }
+    if (!req.organizationId || !req.organization) {
+      return res.status(403).json({ message: "Organization required" });
+    }
+
+    const units = normalizeUnits(req.organization.unitAllocation || {});
+    const requesterPhone = String(req.systemUser.phone || "").trim();
+    const requesterContacts = [req.systemUser.email, requesterPhone].filter(Boolean).join(" / ");
+    await notifySuperadmins({
+      type: "system",
+      title: "Unit reduction requested",
+      message: `${req.organization.name || "An organization"} requested help reducing its registered units. Contact ${req.systemUser.name || "the account owner"}${requesterContacts ? ` at ${requesterContacts}` : ""}. Current allocation: ${units.beds} beds, ${units.rooms} rooms, ${units.shops} shops.`,
+      priority: "high",
+      entityType: "organization",
+      entityId: req.organization._id,
+      actionType: "unit_reduction_request",
+      payload: {
+        organizationId: String(req.organization._id),
+        organizationName: req.organization.name || "",
+        requesterName: req.systemUser.name || "",
+        requesterEmail: req.systemUser.email || "",
+        requesterPhone,
+        units,
+      },
+    });
+
+    res.json({ message: "Your request has been sent to our support team. They will review your occupied and vacant units and contact you using the phone or email registered to your account." });
+  } catch (err) {
+    console.error("unit reduction support request error:", err);
+    res.status(500).json({ message: "Unable to send your request right now." });
+  }
+});
+
 router.post("/subscription/renew-request", requireSystemAuth, async (req, res) => {
   try {
     if (req.systemUser.role === "superadmin") {
@@ -2041,11 +2078,24 @@ router.get(
       const organization = await Organization.findById(req.params.id).lean();
       if (!organization) return res.status(404).json({ message: "Organization not found" });
 
-      const [rooms, activeTenants] = await Promise.all([
+      const [rooms, tenants] = await Promise.all([
         Room.find({ organizationId: organization._id }).lean(),
-        Form.find({ organizationId: organization._id, leaveDate: { $in: [null, ""] } }).lean(),
+        Form.find({ organizationId: organization._id }).lean(),
       ]);
-      const roomHasTenant = (room) => activeTenants.some((tenant) => String(tenant.roomId || "") === String(room._id));
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const isActiveToday = (tenant) => {
+        if (!tenant?.leaveDate) return true;
+        const leaveDate = new Date(tenant.leaveDate);
+        if (Number.isNaN(leaveDate.getTime())) return true;
+        leaveDate.setHours(0, 0, 0, 0);
+        return leaveDate > today;
+      };
+      const activeTenants = tenants.filter(isActiveToday);
+      const roomTenants = (room, bedNo = "") => activeTenants.filter((tenant) =>
+        String(tenant.roomId || "") === String(room._id) &&
+        (!bedNo || String(tenant.bedNo || "").trim().toLowerCase() === String(bedNo).trim().toLowerCase())
+      );
       const supportUnitName = (room) => {
         const name = String(room.category || "").trim();
         return room.isPlaceholder || !name || /^unassigned$/i.test(name) ? "Unit" : name;
@@ -2054,16 +2104,36 @@ router.get(
       rooms.forEach((room) => {
         if (room.propertyType === "bed") {
           (room.beds || []).forEach((bed) => {
-            const occupied = activeTenants.some((tenant) => String(tenant.roomId || "") === String(room._id) && String(tenant.bedNo || "").trim().toLowerCase() === String(bed.bedNo || "").trim().toLowerCase());
-            if (!occupied) rows.push({ id: `${room._id}:bed:${bed.bedNo}`, unitId: String(room._id), kind: "bed", propertyType: "bed", bedNo: bed.bedNo, label: `${supportUnitName(room)} | ${room.isPlaceholder ? "Details pending" : room.roomNo || "Room"} | Bed ${bed.bedNo}`, isPlaceholder: Boolean(room.isPlaceholder) });
+            const occupants = roomTenants(room, bed.bedNo);
+            rows.push({
+              id: `${room._id}:bed:${bed.bedNo}`,
+              unitId: String(room._id),
+              kind: "bed",
+              propertyType: "bed",
+              bedNo: bed.bedNo,
+              label: `${supportUnitName(room)} | ${room.isPlaceholder ? "Details pending" : room.roomNo || "Room"} | Bed ${bed.bedNo}`,
+              isPlaceholder: Boolean(room.isPlaceholder),
+              occupancy: occupants.length ? "occupied" : "vacant",
+              occupants: occupants.map((tenant) => ({ id: String(tenant._id), name: tenant.name || "Tenant", phone: tenant.phoneNo || tenant.mobile || "" })),
+            });
           });
           return;
         }
-        if (!roomHasTenant(room)) rows.push({ id: `${room._id}:unit`, unitId: String(room._id), kind: "unit", propertyType: room.propertyType, label: `${supportUnitName(room)} | ${room.isPlaceholder ? "Details pending" : room.roomNo || "Unit"}`, isPlaceholder: Boolean(room.isPlaceholder) });
+        const occupants = roomTenants(room);
+        rows.push({
+          id: `${room._id}:unit`,
+          unitId: String(room._id),
+          kind: "unit",
+          propertyType: room.propertyType,
+          label: `${supportUnitName(room)} | ${room.isPlaceholder ? "Details pending" : room.roomNo || "Unit"}`,
+          isPlaceholder: Boolean(room.isPlaceholder),
+          occupancy: occupants.length ? "occupied" : "vacant",
+          occupants: occupants.map((tenant) => ({ id: String(tenant._id), name: tenant.name || "Tenant", phone: tenant.phoneNo || tenant.mobile || "" })),
+        });
       });
       res.json(rows);
     } catch (err) {
-      res.status(500).json({ message: "Unable to load vacant units", error: err.message });
+      res.status(500).json({ message: "Unable to load support units", error: err.message });
     }
   }
 );
@@ -2081,8 +2151,22 @@ router.delete(
       if (!room) return res.status(404).json({ message: "Unit not found" });
 
       const reason = String(req.body?.reason || "Customer requested a unit reduction").trim().slice(0, 300);
-      const activeTenants = await Form.find({ organizationId: organization._id, leaveDate: { $in: [null, ""] } }).lean();
-      const hasTenant = (bedNo) => activeTenants.some((tenant) => String(tenant.roomId || "") === String(room._id) && (!bedNo || String(tenant.bedNo || "").trim().toLowerCase() === String(bedNo).trim().toLowerCase()));
+      const allTenants = await Form.find({ organizationId: organization._id });
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const effectiveDate = today.toISOString().slice(0, 10);
+      const isActiveToday = (tenant) => {
+        if (!tenant?.leaveDate) return true;
+        const leaveDate = new Date(tenant.leaveDate);
+        if (Number.isNaN(leaveDate.getTime())) return true;
+        leaveDate.setHours(0, 0, 0, 0);
+        return leaveDate > today;
+      };
+      const tenantsForUnit = (bedNo = "") => allTenants.filter((tenant) =>
+        isActiveToday(tenant) &&
+        String(tenant.roomId || "") === String(room._id) &&
+        (!bedNo || String(tenant.bedNo || "").trim().toLowerCase() === String(bedNo).trim().toLowerCase())
+      );
       const kind = String(req.body?.kind || "");
       const bedNo = String(req.body?.bedNo || "").trim();
       let removed = null;
@@ -2092,16 +2176,42 @@ router.delete(
         if (room.propertyType !== "bed" || !bedNo) return res.status(400).json({ message: "Select a hostel bed to remove" });
         const bed = (room.beds || []).find((item) => String(item.bedNo || "").trim().toLowerCase() === bedNo.toLowerCase());
         if (!bed) return res.status(404).json({ message: "Bed not found" });
-        if (hasTenant(bedNo)) return res.status(400).json({ message: "This bed cannot be removed because it has an active tenant" });
+        const affectedTenants = tenantsForUnit(bedNo);
+        if (affectedTenants.length) {
+          await Form.updateMany(
+            { _id: { $in: affectedTenants.map((tenant) => tenant._id) } },
+            { $set: {
+              leaveDate: effectiveDate,
+              unitRemoval: {
+                removedAt: new Date(), effectiveDate, propertyType: "bed", unitId: String(room._id),
+                roomNo: String(room.roomNo || ""), bedNo, label: `${room.category || "Unit"} | ${room.roomNo || "Room"} | Bed ${bedNo}`,
+                reason, removedBy: req.systemUser.name || "Superadmin",
+              },
+            } }
+          );
+        }
         room.beds = (room.beds || []).filter((item) => String(item.bedNo || "").trim().toLowerCase() !== bedNo.toLowerCase());
         await room.save();
-        removed = { type: "bed", bedNo, roomNo: room.roomNo };
+        removed = { type: "bed", bedNo, roomNo: room.roomNo, affectedTenants: affectedTenants.map((tenant) => ({ id: String(tenant._id), name: tenant.name })) };
         decrement.beds = 1;
       } else {
         if (room.propertyType === "bed") return res.status(400).json({ message: "Remove hostel beds individually" });
-        if (hasTenant()) return res.status(400).json({ message: "This unit cannot be removed because it has an active tenant" });
+        const affectedTenants = tenantsForUnit();
+        if (affectedTenants.length) {
+          await Form.updateMany(
+            { _id: { $in: affectedTenants.map((tenant) => tenant._id) } },
+            { $set: {
+              leaveDate: effectiveDate,
+              unitRemoval: {
+                removedAt: new Date(), effectiveDate, propertyType: room.propertyType, unitId: String(room._id),
+                roomNo: String(room.roomNo || ""), bedNo: "", label: `${room.category || "Unit"} | ${room.roomNo || "Unit"}`,
+                reason, removedBy: req.systemUser.name || "Superadmin",
+              },
+            } }
+          );
+        }
         await Room.deleteOne({ _id: room._id });
-        removed = { type: room.propertyType, roomNo: room.roomNo };
+        removed = { type: room.propertyType, roomNo: room.roomNo, affectedTenants: affectedTenants.map((tenant) => ({ id: String(tenant._id), name: tenant.name })) };
         decrement[room.propertyType === "shop" ? "shops" : "rooms"] = 1;
       }
 
@@ -2115,8 +2225,9 @@ router.delete(
         await latestSubscription.save();
       }
       await AuditLog.create({ organizationId: organization._id, entityType: "unit", entityId: room._id, action: "delete", actorId: String(req.systemUser._id), actorName: req.systemUser.name || "Superadmin", actorEmail: req.systemUser.email || "", actorRole: "superadmin", reason, before: { propertyType: room.propertyType, roomNo: room.roomNo, bedNo: bedNo || null }, after: { units: newUnits }, changes: { removed, decrement } });
-      await notifyOrganization(organization._id, { type: "system", title: "Unit count updated", message: "A vacant unit was removed by support. Your subscription amount will reflect the updated unit count.", priority: "normal", entityType: "organization", entityId: organization._id, actionType: "unit_reduction", payload: { removed, units: newUnits, reason } });
-      res.json({ message: "Vacant unit removed and subscription count updated", units: newUnits, removed });
+      const affectedCount = removed?.affectedTenants?.length || 0;
+      await notifyOrganization(organization._id, { type: "system", title: "Unit count updated", message: affectedCount ? `A unit with ${affectedCount} active tenant(s) was retired by support. Their records remain available as history from ${effectiveDate}.` : "A vacant unit was removed by support. Your subscription amount will reflect the updated unit count.", priority: "normal", entityType: "organization", entityId: organization._id, actionType: "unit_reduction", payload: { removed, units: newUnits, reason, effectiveDate } });
+      res.json({ message: affectedCount ? "Unit retired. Tenant history was retained and the subscription count was updated." : "Vacant unit removed and subscription count updated", units: newUnits, removed, effectiveDate });
     } catch (err) {
       res.status(500).json({ message: "Unable to remove unit", error: err.message });
     }
