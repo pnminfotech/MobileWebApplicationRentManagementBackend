@@ -134,6 +134,24 @@ const hostelRulesSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const propertyWingSchema = new mongoose.Schema(
+  {
+    name: { type: String, trim: true, required: true },
+    floors: { type: [String], default: [] },
+  },
+  { _id: false }
+);
+
+const propertyLocationSchema = new mongoose.Schema(
+  {
+    propertyType: { type: String, enum: ["bed", "room", "shop"], required: true },
+    name: { type: String, trim: true, required: true },
+    wings: { type: [propertyWingSchema], default: [] },
+    floors: { type: [String], default: [] },
+  },
+  { _id: true }
+);
+
 const organizationSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
@@ -152,6 +170,7 @@ const organizationSchema = new mongoose.Schema(
       type: [String],
       default: ["Standard", "Single",  "Bunk"],
     },
+    propertyLocations: { type: [propertyLocationSchema], default: [] },
     features: { type: featureSchema, default: () => ({}) },
     canteenSettings: { type: canteenSettingsSchema, default: () => ({}) },
     canteenSettingsHistory: {

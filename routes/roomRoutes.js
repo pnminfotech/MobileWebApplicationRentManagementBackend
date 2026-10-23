@@ -208,6 +208,57 @@ const {
 router.use(attachSystemAuthIfPresent);
 router.use(authAdmin);
 
+function normalizePropertyLocations(value) {
+  if (!Array.isArray(value)) return null;
+  const uniqueNames = new Set();
+  return value.slice(0, 200).map((item) => {
+    const propertyType = normalizePropertyType(item?.propertyType);
+    const name = normalizeText(item?.name).slice(0, 100);
+    if (!name) return null;
+    const nameKey = `${propertyType}::${name.toLowerCase()}`;
+    if (uniqueNames.has(nameKey)) return null;
+    uniqueNames.add(nameKey);
+    const normalizeList = (items) => [...new Map(
+      (Array.isArray(items) ? items : [])
+        .map(normalizeText)
+        .filter(Boolean)
+        .map((entry) => [entry.toLowerCase(), entry.slice(0, 60)])
+    ).values()];
+    const wings = (Array.isArray(item?.wings) ? item.wings : []).slice(0, 100).map((wing) => ({
+      name: normalizeText(wing?.name).slice(0, 60),
+      floors: normalizeList(wing?.floors),
+    })).filter((wing) => wing.name);
+    return { propertyType, name, wings, floors: normalizeList(item?.floors) };
+  }).filter(Boolean);
+}
+
+router.get("/property-locations", async (req, res) => {
+  try {
+    res.json(req.organization?.propertyLocations || req.admin?.propertyLocations || []);
+  } catch (err) {
+    res.status(500).json({ message: "Unable to load properties." });
+  }
+});
+
+router.put("/property-locations", async (req, res) => {
+  try {
+    const propertyLocations = normalizePropertyLocations(req.body?.propertyLocations);
+    if (!propertyLocations) return res.status(400).json({ message: "Property list is invalid." });
+    if (req.organization) {
+      req.organization.propertyLocations = propertyLocations;
+      await req.organization.save();
+    } else if (req.admin && typeof req.admin.save === "function") {
+      req.admin.propertyLocations = propertyLocations;
+      await req.admin.save();
+    } else {
+      return res.status(403).json({ message: "Property settings are unavailable for this account." });
+    }
+    res.json({ propertyLocations });
+  } catch (err) {
+    res.status(500).json({ message: "Unable to save properties." });
+  }
+});
+
 function normalizePropertyType(value) {
   const raw = String(value || "").trim().toLowerCase();
   if (raw === "room" || raw === "shop") return raw;
@@ -319,18 +370,13 @@ router.put("/properties/rename", async (req, res) => {
     }
 
     // Find all units belonging to this property
-    const sourceUnits = await Room.find(
-      scopedQuery(req, {
-        propertyType,
-        category: oldName,
-      })
-    ).lean();
-
-    if (!sourceUnits.length) {
-      return res.status(404).json({
-        message: "Property not found",
-      });
-    }
+    const oldPropertyQuery = scopedQuery(req, {
+      propertyType,
+      category: oldName,
+    });
+    const sourceUnits = await Room.find(oldPropertyQuery)
+      .collation({ locale: "en", strength: 2 })
+      .lean();
 
     // Check whether new property name already exists
     // and would create duplicate units
@@ -376,29 +422,15 @@ router.put("/properties/rename", async (req, res) => {
 
     // Update property name in ALL rooms/units
     const roomResult = await Room.updateMany(
-      scopedQuery(req, {
-        propertyType,
-        category: oldName,
-      }),
-      {
-        $set: scopedUpdate(req, {
-          category: newName,
-        }),
-      }
-    );
+      oldPropertyQuery,
+      { $set: scopedUpdate(req, { category: newName }) }
+    ).collation({ locale: "en", strength: 2 });
 
     // Update property name in ALL tenant records also
     const tenantResult = await Form.updateMany(
-      scopedQuery(req, {
-        propertyType,
-        category: oldName,
-      }),
-      {
-        $set: scopedUpdate(req, {
-          category: newName,
-        }),
-      }
-    );
+      scopedQuery(req, { propertyType, category: oldName }),
+      { $set: scopedUpdate(req, { category: newName }) }
+    ).collation({ locale: "en", strength: 2 });
 
     return res.json({
       message: "Property name updated successfully",

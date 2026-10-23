@@ -44,6 +44,7 @@ const userSchema = new mongoose.Schema({
     type: [String],
     default: ["Standard", "Single",  "Bunk"],
   },
+  propertyLocations: { type: [mongoose.Schema.Types.Mixed], default: [] },
 });
 
 userSchema.pre("save", async function (next) {
