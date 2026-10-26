@@ -118,6 +118,17 @@ function pruneConflictingFutureSnapshots(snapshots = [], tenant = {}) {
 }
 
 function getCurrentMonthlyRent(tenant = {}, roomsData = []) {
+  const tenantRent =
+    toNum(tenant?.baseRent) ||
+    toNum(tenant?.rentAmount) ||
+    toNum(tenant?.rent) ||
+    toNum(tenant?.expectedRent) ||
+    toNum(tenant?.defaultRent) ||
+    toNum(tenant?.monthlyRent);
+
+  // Quick-added rent belongs to the tenant, even when the assigned unit has a default price.
+  if (tenant?.tenantRentOverride && tenantRent) return tenantRent;
+
   if (roomsData && tenant?.roomNo && tenant?.bedNo) {
     // Room numbers can repeat across wings/buildings. Prefer the stored roomId
     // and only fall back to the location fields for older tenant records.
@@ -137,14 +148,7 @@ function getCurrentMonthlyRent(tenant = {}, roomsData = []) {
     if (bedRent) return bedRent;
   }
 
-  const currentFromTenant =
-    toNum(tenant?.baseRent) ||
-    toNum(tenant?.rentAmount) ||
-    toNum(tenant?.rent) ||
-    toNum(tenant?.expectedRent) ||
-    toNum(tenant?.defaultRent) ||
-    toNum(tenant?.monthlyRent);
-  if (currentFromTenant) return currentFromTenant;
+  if (tenantRent) return tenantRent;
 
   return 0;
 }

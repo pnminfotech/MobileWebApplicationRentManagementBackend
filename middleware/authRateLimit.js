@@ -42,11 +42,14 @@ function createAuthRateLimit({ name, windowMs, max, keyFromRequest, countSuccess
     }
 
     // Reserve an attempt before the handler runs so concurrent requests cannot
-    // all pass the same remaining slot. Successful requests release the slot;
-    // failed authentication attempts remain counted until the window expires.
+    // all pass the same remaining slot. Depending on the limit, keep either
+    // successful sends or failed authentication attempts in the bucket.
     bucket.count += 1;
     res.once("finish", () => {
-      if (res.statusCode < 400 && !countSuccessfulRequests) {
+      const shouldCount = countSuccessfulRequests
+        ? res.statusCode < 400
+        : res.statusCode >= 400;
+      if (!shouldCount) {
         const current = buckets.get(key);
         if (current === bucket) current.count = Math.max(0, current.count - 1);
       }

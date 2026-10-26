@@ -148,6 +148,7 @@ const propertyLocationSchema = new mongoose.Schema(
     name: { type: String, trim: true, required: true },
     wings: { type: [propertyWingSchema], default: [] },
     floors: { type: [String], default: [] },
+    floorUnitCounts: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
   },
   { _id: true }
 );

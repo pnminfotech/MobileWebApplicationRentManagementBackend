@@ -180,6 +180,8 @@ const formSchema = new mongoose.Schema(
     dob: { type: Date },
 
     baseRent: { type: Number },
+    // Quick-added tenant rent can differ from the assigned unit's default price.
+    tenantRentOverride: { type: Boolean, default: false },
     firstRentStatus: {
   type: String,
   enum: ["ADVANCE_PAID", "NOT_PAID"],

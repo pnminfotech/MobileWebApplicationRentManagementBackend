@@ -88,8 +88,10 @@ const bootstrapIpLimit = createAuthRateLimit({ name: "bootstrap-ip", windowMs: 6
 const registrationIpLimit = createAuthRateLimit({ name: "registration-ip", windowMs: 60 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
 const loginIpLimit = createAuthRateLimit({ name: "login-ip", windowMs: 15 * 60 * 1000, max: 10, keyFromRequest: requestIp });
 const loginAccountLimit = createAuthRateLimit({ name: "login-account", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: accountIdentifier });
-const loginCodeSendIpLimit = createAuthRateLimit({ name: "login-code-send-ip", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
-const loginCodeSendAccountLimit = createAuthRateLimit({ name: "login-code-send-account", windowMs: 60 * 60 * 1000, max: 3, keyFromRequest: accountIdentifier, countSuccessfulRequests: true });
+// Count failed code-send attempts only; a successful login request should not
+// prevent the same user from signing in again after logging out.
+const loginCodeSendIpLimit = createAuthRateLimit({ name: "login-code-send-fail-ip", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: requestIp });
+const loginCodeSendAccountLimit = createAuthRateLimit({ name: "login-code-send-fail-account", windowMs: 60 * 60 * 1000, max: 5, keyFromRequest: accountIdentifier });
 const loginCodeVerifyIpLimit = createAuthRateLimit({ name: "login-code-verify-ip", windowMs: 15 * 60 * 1000, max: 10, keyFromRequest: requestIp });
 const loginCodeVerifyChallengeLimit = createAuthRateLimit({ name: "login-code-verify-challenge", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: challengeIdentifier });
 const loginCodeResendIpLimit = createAuthRateLimit({ name: "login-code-resend-ip", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
@@ -169,15 +171,11 @@ function maskedEmail(email) {
   return `${local.slice(0, 1)}***@${domain}`;
 }
 
-async function deliverSuperadminLoginCode(user, challengeId, code) {
+async function deliverSuperadminLoginCode(user, code) {
   try {
     await sendLoginEmailCode({ to: user.email, name: user.name, code, expiresMinutes: 10 });
     return true;
   } catch (error) {
-    await LoginEmailChallenge.updateOne(
-      { _id: challengeId, usedAt: null },
-      { $set: { usedAt: new Date() } }
-    );
     if (error?.code !== "SMTP_NOT_CONFIGURED") {
       console.error("login code email delivery failed:", error?.message || error);
     }
@@ -215,7 +213,7 @@ async function startEmailLoginChallenge(req, res) {
     expiresAt: new Date(Date.now() + 10 * 60 * 1000),
   });
 
-  const delivered = await deliverSuperadminLoginCode(user, challenge._id, code);
+  const delivered = await deliverSuperadminLoginCode(user, code);
   if (!delivered) {
     return res.status(503).json({ message: "Unable to send the verification code. Check the server email settings or contact support." });
   }
@@ -602,7 +600,7 @@ router.post("/auth/login", loginIpLimit, loginAccountLimit, async (req, res) => 
         expiresAt,
       });
 
-      const delivered = await deliverSuperadminLoginCode(user, challenge._id, code);
+      const delivered = await deliverSuperadminLoginCode(user, code);
       if (!delivered) {
         return res.status(503).json({ message: "Unable to send the verification code. Check the server email settings or contact support." });
       }
@@ -834,17 +832,28 @@ router.post("/auth/login/resend-email-code", loginCodeResendIpLimit, loginCodeRe
     const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
     const now = new Date();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    const previousChallengeState = {
+      codeHash: challenge.codeHash,
+      expiresAt: challenge.expiresAt,
+      attempts: challenge.attempts,
+      emailVerifiedAt: challenge.emailVerifiedAt,
+    };
+    const nextCodeHash = hashLoginCode(challenge._id, code);
     const updatedChallenge = await LoginEmailChallenge.findOneAndUpdate(
       { _id: challenge._id, usedAt: null, expiresAt: { $gt: now }, resendCount: { $lt: 2 } },
-      { $set: { codeHash: hashLoginCode(challenge._id, code), expiresAt, attempts: 0, emailVerifiedAt: null }, $inc: { resendCount: 1 } },
+      { $set: { codeHash: nextCodeHash, expiresAt, attempts: 0, emailVerifiedAt: null }, $inc: { resendCount: 1 } },
       { new: true }
     );
     if (!updatedChallenge) {
       return res.status(429).json({ message: "Code resend limit reached. Please sign in again later." });
     }
 
-    const delivered = await deliverSuperadminLoginCode(user, challenge._id, code);
+    const delivered = await deliverSuperadminLoginCode(user, code);
     if (!delivered) {
+      await LoginEmailChallenge.updateOne(
+        { _id: challenge._id, codeHash: nextCodeHash, resendCount: updatedChallenge.resendCount },
+        { $set: previousChallengeState, $inc: { resendCount: -1 } }
+      );
       return res.status(503).json({ message: "Unable to send the verification code. Check the server email settings or contact support." });
     }
 

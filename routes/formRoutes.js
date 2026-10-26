@@ -27,6 +27,60 @@ const {
 const { getCanteenQuoteForMonth } = require("./_helpers/canteenBilling");
 const { getLightBillQuoteForMonth } = require("./_helpers/lightBillBilling");
 const { sendRentReminderSmsJob } = require("../services/rentReminderSmsService");
+const { deriveFirstRentMonth } = require("./_helpers/firstRentCycle");
+
+const hasLegacyQuickTenantRentHistory = (tenant = {}) => {
+  const history = Array.isArray(tenant.rentHistory) ? tenant.rentHistory : [];
+  return history.some((entry) =>
+    entry?.source === "initial-before-shift" &&
+    !String(entry?.roomNo || "").trim() &&
+    !String(entry?.bedNo || "").trim()
+  ) && history.some((entry) =>
+    entry?.source === "shift" &&
+    !String(entry?.previousRoomNo || "").trim() &&
+    !String(entry?.previousBedNo || "").trim()
+  );
+};
+
+// Repair quick-added tenants saved by the earlier flow, which logged their
+// first rent edit as a unit shift and did not create an advance payment entry.
+async function repairLegacyQuickTenantRent(req, tenant = {}) {
+  if (!tenant?._id || !hasLegacyQuickTenantRentHistory(tenant)) return tenant;
+
+  const amount = Number(tenant.baseRent ?? tenant.rentAmount ?? 0);
+  const firstRentStatus = String(tenant.firstRentStatus || "").trim();
+  const firstRentMonth = String(tenant.firstRentMonth || "").trim() ||
+    deriveFirstRentMonth(tenant.joiningDate, firstRentStatus);
+  const rents = Array.isArray(tenant.rents) ? [...tenant.rents] : [];
+  if (
+    firstRentStatus === "ADVANCE_PAID" &&
+    firstRentMonth &&
+    amount > 0 &&
+    !rents.some((entry) => String(entry?.month || "").trim() === firstRentMonth)
+  ) {
+    rents.push({
+      rentAmount: amount,
+      date: tenant.joiningDate || tenant.createdAt || new Date(),
+      month: firstRentMonth,
+      paymentMode: "Cash",
+    });
+  }
+
+  const rentHistory = amount > 0 ? [{
+    effectiveFrom: tenant.joiningDate || tenant.createdAt || new Date(),
+    roomNo: String(tenant.roomNo || ""),
+    bedNo: String(tenant.bedNo || ""),
+    baseRent: amount,
+    rentAmount: amount,
+    source: "initial",
+  }] : [];
+  const repaired = await Form.findOneAndUpdate(
+    scopedQuery(req, { _id: tenant._id }),
+    { $set: scopedUpdate(req, { rentHistory, rents, tenantRentOverride: true }) },
+    { new: true, runValidators: true }
+  ).lean();
+  return repaired || tenant;
+}
 
 // Controllers
 const {
@@ -69,6 +123,91 @@ router.use(authAdmin);
 //       instead of trusting srNo from frontend.
 // ───────────────────────────────────────────────────────────────────────────────
 router.post("/forms", createWithOptionalInvite);
+
+// Save a tenant before a unit has been selected. These records are excluded
+// from occupancy until the admin assigns a room, bed, or shop later.
+router.post("/forms/quick-add", async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const name = String(body.name || "").trim();
+    const phoneDigits = String(body.phoneNo || "").replace(/\D/g, "");
+    const propertyType = String(body.propertyType || "bed").trim().toLowerCase();
+    const joiningDate = body.joiningDate ? new Date(body.joiningDate) : null;
+    const depositAmount = Number(body.depositAmount);
+    const rentAmount = Number(body.rentAmount);
+    const pincode = String(body.pincode || "").trim();
+    const firstRentStatus = String(body.firstRentStatus || "").trim().toUpperCase();
+
+    if (!name) return res.status(400).json({ message: "Tenant name is required." });
+    if (!/^\d{10}$/.test(phoneDigits)) {
+      return res.status(400).json({ message: "Enter a valid 10-digit phone number." });
+    }
+    if (!Number.isFinite(depositAmount) || depositAmount < 0 || body.depositAmount === "") {
+      return res.status(400).json({ message: "Enter a valid deposit amount (0 or more)." });
+    }
+    if (!Number.isFinite(rentAmount) || rentAmount <= 0 || body.rentAmount === "") {
+      return res.status(400).json({ message: "Enter a valid monthly rent greater than 0." });
+    }
+    if (!["bed", "room", "shop"].includes(propertyType)) {
+      return res.status(400).json({ message: "Select a valid tenant section." });
+    }
+    if (!joiningDate || Number.isNaN(joiningDate.getTime())) {
+      return res.status(400).json({ message: "Enter a valid joining date." });
+    }
+    if (pincode && !/^\d{6}$/.test(pincode)) {
+      return res.status(400).json({ message: "Enter a valid 6-digit pincode." });
+    }
+    if (!["ADVANCE_PAID", "NOT_PAID"].includes(firstRentStatus)) {
+      return res.status(400).json({ message: "Select a valid rent cycle." });
+    }
+
+    const joiningParts = String(body.joiningDate).split("T")[0].split("-").map(Number);
+    const firstRentMonthDate = new Date(joiningParts[0], joiningParts[1] - 1 + (firstRentStatus === "NOT_PAID" ? 1 : 0), 1);
+    const firstRentMonth = `${firstRentMonthDate.toLocaleString("en-US", { month: "short" })}-${String(firstRentMonthDate.getFullYear()).slice(-2)}`;
+
+    const srNo = await assignNextSrNoAndUpdateCounter();
+    const tenant = await Form.create(scopedCreate(req, {
+      srNo,
+      name,
+      phoneNo: Number(phoneDigits),
+      joiningDate,
+      depositAmount,
+      address: String(body.address || "").trim(),
+      pincode,
+      city: String(body.city || "").trim(),
+      state: String(body.state || "").trim(),
+      houseNo: String(body.houseNo || "").trim(),
+      nearbyPlace: String(body.nearbyPlace || "").trim(),
+      propertyType,
+      roomId: "",
+      category: "",
+      wingName: "",
+      floorNo: "",
+      roomNo: "",
+      bedNo: "",
+      baseRent: rentAmount,
+      rentAmount,
+      tenantRentOverride: true,
+      rents: firstRentStatus === "ADVANCE_PAID"
+        ? [{ rentAmount, date: joiningDate, month: firstRentMonth, paymentMode: "Cash" }]
+        : [],
+      intakeStatus: "pending_tenant",
+      firstRentStatus,
+      firstRentMonth,
+      hasCanteen: false,
+    }));
+
+    return res.status(201).json({ ok: true, form: tenant });
+  } catch (error) {
+    console.error("Quick add tenant error:", error);
+    const isValidation = error?.name === "ValidationError" || error?.name === "CastError";
+    const isDuplicate = error?.code === 11000;
+    return res.status(isDuplicate ? 409 : isValidation ? 400 : 500).json({
+      message: "Could not save tenant details.",
+      error: error.message,
+    });
+  }
+});
 
 // For UI to show next SrNo (server still assigns the real one)
 router.get("/forms/count", getNextSrNo);
@@ -291,8 +430,11 @@ router.get("/forms/rent-dues", authAdmin, async (req, res) => {
       Room.find(scopedQuery(req)).lean(),
     ]);
     const asOf = new Date();
-    const dueTenants = tenants
-      .filter((tenant) => tenant.intakeStatus !== "pending_tenant")
+    const activeTenants = await Promise.all(
+      tenants.filter((tenant) => tenant.intakeStatus !== "pending_tenant")
+        .map((tenant) => repairLegacyQuickTenantRent(req, tenant))
+    );
+    const dueTenants = activeTenants
       .map((tenant) => {
         const dueMonths = getUnpaidRentBeforeDate(tenant, asOf, rooms);
         const totalDue = dueMonths.reduce(
@@ -341,7 +483,11 @@ router.get("/forms/rent-summary", authAdmin, async (req, res) => {
     const parsed = parseMonthKey(String(req.query.month || ""));
     if (!parsed) return res.status(400).json({ message: "Valid month is required" });
     const [tenants, rooms] = await Promise.all([Form.find(scopedQuery(req)).lean(), Room.find(scopedQuery(req)).lean()]);
-    const rows = await Promise.all(tenants.filter((tenant) => tenant.intakeStatus !== "pending_tenant").map(async (tenant) => {
+    const activeTenants = await Promise.all(
+      tenants.filter((tenant) => tenant.intakeStatus !== "pending_tenant")
+        .map((tenant) => repairLegacyQuickTenantRent(req, tenant))
+    );
+    const rows = await Promise.all(activeTenants.map(async (tenant) => {
       const grossExpected = getExpectedRentForMonth(tenant, parsed.y, parsed.m, rooms);
       const paid = getPaidAmountForMonth(tenant.rents, parsed.y, parsed.m);
       const canteen = await getCanteenQuoteForMonth(req, tenant, req.query.month);
@@ -410,11 +556,12 @@ router.get("/forms/rent-range-summary", authAdmin, async (req, res) => {
 
 router.get("/form/:id/rent-due", authAdmin, async (req, res) => {
   try {
-    const [tenant, rooms] = await Promise.all([
+    const [tenantRecord, rooms] = await Promise.all([
       Form.findOne(scopedQuery(req, { _id: req.params.id })).lean(),
       Room.find(scopedQuery(req)).lean(),
     ]);
-    if (!tenant) return res.status(404).json({ message: "Tenant not found" });
+    if (!tenantRecord) return res.status(404).json({ message: "Tenant not found" });
+    const tenant = await repairLegacyQuickTenantRent(req, tenantRecord);
 
     const dueMonths = getUnpaidRentBeforeDate(tenant, new Date(), rooms);
     res.json({
@@ -432,11 +579,12 @@ router.get("/form/:id/rent-quote", authAdmin, async (req, res) => {
   try {
     const parsed = parseMonthKey(String(req.query.month || ""));
     if (!parsed) return res.status(400).json({ message: "Valid month is required" });
-    const [tenant, rooms] = await Promise.all([
+    const [tenantRecord, rooms] = await Promise.all([
       Form.findOne(scopedQuery(req, { _id: req.params.id })).lean(),
       Room.find(scopedQuery(req)).lean(),
     ]);
-    if (!tenant) return res.status(404).json({ message: "Tenant not found" });
+    if (!tenantRecord) return res.status(404).json({ message: "Tenant not found" });
+    const tenant = await repairLegacyQuickTenantRent(req, tenantRecord);
     const breakdown = getRentProrationForMonth(tenant, parsed.y, parsed.m, rooms);
     const paid = getPaidAmountForMonth(tenant.rents, parsed.y, parsed.m);
     const canteen = await getCanteenQuoteForMonth(req, tenant, req.query.month);
@@ -532,7 +680,9 @@ router.post("/forms/:id/shift-preview", async (req, res) => {
       hasWing: Boolean(targetUnit.hasWing && targetUnit.wingName),
       wingName: targetUnit.wingName || "",
       bedNo: selectedBed.bedNo || "",
-      baseRent: Number(selectedBed.price || tenant.baseRent || 0),
+      baseRent: Number(tenant.tenantRentOverride
+        ? (tenant.baseRent ?? tenant.rentAmount ?? selectedBed.price ?? 0)
+        : (selectedBed.price || tenant.baseRent || tenant.rentAmount || 0)),
       shiftEffectiveFrom: shiftDate,
     };
     const prospective = { ...tenant, ...update, ...appendRentHistorySnapshot(tenant, update) };
@@ -609,7 +759,9 @@ router.post("/forms/:id/shift", async (req, res) => {
       floorNo: targetUnit.floorNo || "",
       roomNo: targetUnit.roomNo || "",
       bedNo: selectedBed.bedNo || "",
-      baseRent: Number(selectedBed.price || tenant.baseRent || 0),
+      baseRent: Number(tenant.tenantRentOverride
+        ? (tenant.baseRent ?? tenant.rentAmount ?? selectedBed.price ?? 0)
+        : (selectedBed.price || tenant.baseRent || tenant.rentAmount || 0)),
       shiftEffectiveFrom: new Date(effectiveDate),
     };
     Object.assign(update, appendRentHistorySnapshot(previous, update));

@@ -228,7 +228,11 @@ function normalizePropertyLocations(value) {
       name: normalizeText(wing?.name).slice(0, 60),
       floors: normalizeList(wing?.floors),
     })).filter((wing) => wing.name);
-    return { propertyType, name, wings, floors: normalizeList(item?.floors) };
+    const floorUnitCounts = Object.fromEntries(Object.entries(item?.floorUnitCounts && typeof item.floorUnitCounts === "object" ? item.floorUnitCounts : {})
+      .slice(0, 500)
+      .map(([key, count]) => [normalizeText(key).slice(0, 140), Math.max(0, Math.min(5000, Math.floor(Number(count) || 0)))])
+      .filter(([key]) => key));
+    return { propertyType, name, wings, floors: normalizeList(item?.floors), floorUnitCounts };
   }).filter(Boolean);
 }
 
@@ -569,7 +573,7 @@ router.post("/", async (req, res) => {
       normalizedPropertyType === "room" ? normalizeText(flatType) : "";
     const normalizedMeterNo = normalizeIdentifier(meterNo);
     const normalizedPrice =
-      price === undefined || price === "" ? null : Number(price);
+      price === undefined || price === "" || price === null ? null : Number(price);
     const normalizedLastMeterReading =
       lastMeterReading === undefined || lastMeterReading === "" || lastMeterReading === null
         ? null
@@ -825,10 +829,12 @@ router.post("/:roomId/bed", async (req, res) => {
     bedNo = normalizeIdentifier(bedNo);
     bedCategory = bedCategory ? normalizeText(bedCategory) : "";
 
-    if (price === undefined || price === "") price = null;
+    if (price === undefined || price === "" || price === null) price = null;
     else {
       price = Number(price);
-      if (Number.isNaN(price)) price = null;
+      if (!Number.isFinite(price) || price < 0) {
+        return res.status(400).json({ message: "Invalid monthly price" });
+      }
     }
 
     room.beds.push({ bedNo, bedCategory, price });
@@ -914,10 +920,12 @@ router.post("/:roomId/bed/from-placeholder", async (req, res) => {
     }
 
     bedCategory = bedCategory ? normalizeText(bedCategory) : "";
-    if (price === undefined || price === "") price = null;
+    if (price === undefined || price === "" || price === null) price = null;
     else {
       price = Number(price);
-      if (Number.isNaN(price)) price = null;
+      if (!Number.isFinite(price) || price < 0) {
+        return res.status(400).json({ message: "Invalid monthly price" });
+      }
     }
 
     room.beds.push({ bedNo, bedCategory, price });
@@ -965,10 +973,10 @@ router.put("/:roomId/bed/:bedNo", async (req, res) => {
 
     // ✅ Update price (allow clearing)
     if (price !== undefined) {
-      if (price === "") bed.price = null;
+      if (price === "" || price === null) bed.price = null;
       else {
         const num = Number(price);
-        if (Number.isNaN(num))
+        if (!Number.isFinite(num) || num < 0)
           return res.status(400).json({ message: "Invalid price" });
         bed.price = num;
       }
@@ -1075,7 +1083,7 @@ router.delete("/:roomId", requireSystemSecurityPin, async (req, res) => {
 // ✅ PUT /api/rooms/:roomId  -> update room category (and optionally floorNo/roomNo later)
 router.put("/:roomId", async (req, res) => {
   const { roomId } = req.params;
-  const { category, roomCategory, propertyType, floorNo, roomNo, hasWing, wingName, flatType, meterNo, lastMeterReading } = req.body || {};
+    const { category, roomCategory, propertyType, floorNo, roomNo, hasWing, wingName, flatType, meterNo, lastMeterReading, price } = req.body || {};
 
   try {
     if (
@@ -1088,7 +1096,8 @@ router.put("/:roomId", async (req, res) => {
       wingName === undefined &&
       flatType === undefined &&
       meterNo === undefined &&
-      lastMeterReading === undefined
+      lastMeterReading === undefined &&
+      price === undefined
     ) {
       return res.status(400).json({ message: "At least one room field is required" });
     }
@@ -1141,6 +1150,17 @@ router.put("/:roomId", async (req, res) => {
           return res.status(400).json({ message: "Invalid meter reading" });
         }
         update.lastMeterReading = reading;
+      }
+    }
+    if (price !== undefined) {
+      if (price === "" || price === null) {
+        update["beds.0.price"] = null;
+      } else {
+        const amount = Number(price);
+        if (!Number.isFinite(amount) || amount < 0) {
+          return res.status(400).json({ message: "Invalid monthly price" });
+        }
+        update["beds.0.price"] = amount;
       }
     }
 
@@ -1218,12 +1238,12 @@ router.patch("/:roomId/bed/:bedNo", async (req, res) => {
     const { roomId, bedNo } = req.params;
     const { price, bedCategory } = req.body;
 
-    if (price !== undefined && (Number(price) < 0 || Number.isNaN(Number(price)))) {
+    if (price !== undefined && price !== "" && price !== null && (!Number.isFinite(Number(price)) || Number(price) < 0)) {
       return res.status(400).json({ message: "Invalid price" });
     }
 
     const update = {};
-    if (price !== undefined) update["beds.$.price"] = Number(price);
+    if (price !== undefined) update["beds.$.price"] = price === "" || price === null ? null : Number(price);
     if (bedCategory !== undefined) update["beds.$.bedCategory"] = String(bedCategory);
 
     if (!Object.keys(update).length) {

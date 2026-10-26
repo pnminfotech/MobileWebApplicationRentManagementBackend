@@ -7,7 +7,7 @@ const Invite = require("../models/Invite");
 const Room = require("../models/Room");
 const cron = require("node-cron");
 const Counter = require("../models/counterModel");
-const { normalizeFirstRentCycle } = require("../routes/_helpers/firstRentCycle");
+const { normalizeFirstRentCycle, deriveFirstRentMonth } = require("../routes/_helpers/firstRentCycle");
 const {
   appendRentHistorySnapshot,
   getCurrentMonthlyRent,
@@ -31,9 +31,9 @@ const {
 } = require("../utils/organizationScope");
 const { writeAuditLog } = require("../utils/auditLogger");
 const { resolveNotifications } = require("../services/notificationService");
+const { sendAdmissionSms, sendPaymentReceivedSms } = require("../services/smsService");
 const Organization = require("../models/Organization");
 const SystemUser = require("../models/SystemUser");
-const { sendPaymentReceivedSms } = require("../services/smsService");
 function normalizePropertyType(value) {
   return ["room", "shop"].includes(String(value || "").toLowerCase()) ? String(value).toLowerCase() : "bed";
 }
@@ -1090,7 +1090,7 @@ const updateFormById = async (req, res) => {
 
     const allowed = [
       "name","phoneNo","address","joiningDate","dob","relativeAddress1",
-      "propertyType","category","roomId","floorNo","roomNo","bedNo","baseRent","rentAmount","familyMembers","hasCanteen","canteenPlanType","canteenStartDate","canteenStatusEffectiveFrom","canteenMonthlyAmount","canteenIncludedMeals","canteenMealPrices","canteenStatusHistory","shopName","shopBusiness","companyAddress","dateOfJoiningCollege","depositAmount",
+      "propertyType","category","wingName","roomId","floorNo","roomNo","bedNo","baseRent","rentAmount","tenantRentOverride","familyMembers","hasCanteen","canteenPlanType","canteenStartDate","canteenStatusEffectiveFrom","canteenMonthlyAmount","canteenIncludedMeals","canteenMealPrices","canteenStatusHistory","shopName","shopBusiness","companyAddress","dateOfJoiningCollege","depositAmount",
       "firstRentStatus","firstRentMonth",
       "relative1Relation","relative1Name","relative1Phone",
       "relative2Relation","relative2Name","relative2Phone",
@@ -1122,6 +1122,8 @@ const updateFormById = async (req, res) => {
     }
     update.propertyType = propertyTypeFromTenantData({ ...existing.toObject(), ...update });
     update.intakeStatus = normalizeIntakeStatus(update.intakeStatus || existing.intakeStatus);
+    // Pending records come from Quick tenant add and retain the rent entered there.
+    if (existing.intakeStatus === "pending_tenant") update.tenantRentOverride = true;
 
     ["dob", "dateOfJoiningCollege", "canteenStartDate", "canteenStatusEffectiveFrom", "shiftEffectiveFrom", "shiftDate", "effectiveFrom"].forEach((field) => {
       if (update[field] === "") update[field] = undefined;
@@ -1136,6 +1138,7 @@ const updateFormById = async (req, res) => {
     if (update.relative1Relation !== undefined) update.relative1Relation = normalizeContactRelation(update.relative1Relation);
     if (update.relative2Relation !== undefined) update.relative2Relation = normalizeContactRelation(update.relative2Relation);
     if (update.firstRentStatus !== undefined) update.firstRentStatus = normalizeFirstRentStatus(update.firstRentStatus);
+    if (update.tenantRentOverride !== undefined) update.tenantRentOverride = Boolean(update.tenantRentOverride);
     Object.keys(update).forEach((key) => {
       if (update[key] === undefined) delete update[key];
     });
@@ -1174,9 +1177,69 @@ const updateFormById = async (req, res) => {
     }
 
     Object.assign(update, normalizeFirstRentCycle(existing.toObject(), update));
-    const rentHistoryUpdate = appendRentHistorySnapshot(existing.toObject(), update);
-    if (rentHistoryUpdate.rentHistory) {
-      Object.assign(update, rentHistoryUpdate);
+    const previousRentHistory = Array.isArray(existing.rentHistory) ? existing.rentHistory : [];
+    const hasUnassignedQuickAddRentHistory = previousRentHistory.some((entry) =>
+      entry?.source === "initial-before-shift" &&
+      !String(entry?.roomNo || "").trim() &&
+      !String(entry?.bedNo || "").trim()
+    ) && previousRentHistory.some((entry) =>
+      entry?.source === "shift" &&
+      !String(entry?.previousRoomNo || "").trim() &&
+      !String(entry?.previousBedNo || "").trim()
+    );
+
+    // Editing an unassigned tenant's rent is not a unit shift. Remove any
+    // legacy snapshots created by that old behavior; rate history starts when
+    // the tenant gets their first assigned unit.
+    if (existing.intakeStatus === "pending_tenant") {
+      update.rentHistory = [];
+    } else if (hasUnassignedQuickAddRentHistory) {
+      update.tenantRentOverride = true;
+      const currentRent = Number(update.baseRent ?? update.rentAmount ?? existing.baseRent ?? existing.rentAmount ?? 0);
+      update.rentHistory = currentRent > 0 ? [{
+        effectiveFrom: existing.joiningDate || update.joiningDate || new Date(),
+        roomNo: String(update.roomNo ?? existing.roomNo ?? ""),
+        bedNo: String(update.bedNo ?? existing.bedNo ?? ""),
+        baseRent: currentRent,
+        rentAmount: currentRent,
+        source: "initial",
+      }] : [];
+    } else {
+      const rentHistoryUpdate = appendRentHistorySnapshot(existing.toObject(), update);
+      if (rentHistoryUpdate.rentHistory) Object.assign(update, rentHistoryUpdate);
+    }
+
+    // "Pay at Joining (Advance)" is an actual initial rent payment. Older
+    // quick-added records stored only the cycle choice, so reconcile those
+    // records when they are next saved or assigned.
+    if (existing.intakeStatus === "pending_tenant" || hasUnassignedQuickAddRentHistory) {
+      const firstRentStatus = String(update.firstRentStatus || existing.firstRentStatus || "").trim();
+      const firstRentMonth = String(update.firstRentMonth || existing.firstRentMonth || "").trim() ||
+        deriveFirstRentMonth(update.joiningDate || existing.joiningDate, firstRentStatus);
+      const rentEntries = Array.isArray(update.rents) ? [...update.rents] : Array.isArray(existing.rents) ? [...existing.rents] : [];
+      const firstMonthIndex = rentEntries.findIndex((entry) => String(entry?.month || "").trim() === firstRentMonth);
+      const advanceAmount = Number(update.baseRent ?? update.rentAmount ?? existing.baseRent ?? existing.rentAmount ?? 0);
+      if (existing.intakeStatus === "pending_tenant" && firstRentStatus !== "ADVANCE_PAID" && firstMonthIndex >= 0) {
+        // The auto-recorded advance is only a consequence of the pending
+        // tenant's rent-cycle selection. Remove it if that selection changes
+        // to the normal month-end cycle before assignment.
+        rentEntries.splice(firstMonthIndex, 1);
+      } else if (firstRentStatus === "ADVANCE_PAID" && firstRentMonth && Number.isFinite(advanceAmount) && advanceAmount > 0) {
+        if (existing.intakeStatus === "pending_tenant" && firstMonthIndex >= 0) {
+          rentEntries[firstMonthIndex] = {
+            ...rentEntries[firstMonthIndex],
+            rentAmount: advanceAmount,
+          };
+        } else if (firstMonthIndex < 0) {
+          rentEntries.push({
+            rentAmount: advanceAmount,
+            date: existing.joiningDate || update.joiningDate || new Date(),
+            month: firstRentMonth,
+            paymentMode: "Cash",
+          });
+        }
+      }
+      update.rents = rentEntries;
     }
 
     const updated = await Form.findOneAndUpdate(
@@ -1184,6 +1247,24 @@ const updateFormById = async (req, res) => {
       { $set: scopedUpdate(req, update) },
       { new: true, runValidators: true }
     );
+
+    const assignedPropertyType = String(updated?.propertyType || "bed").toLowerCase();
+    const hasAssignedUnit = assignedPropertyType === "bed"
+      ? Boolean(String(updated?.roomNo || "").trim() && String(updated?.bedNo || "").trim())
+      : Boolean(String(updated?.roomNo || "").trim());
+    if (
+      existing.intakeStatus === "pending_tenant" &&
+      updated?.intakeStatus !== "pending_tenant" &&
+      hasAssignedUnit
+    ) {
+      Promise.resolve().then(async () => {
+        const organizationId = updated.organizationId || req.organization?._id || req.organizationId;
+        const organization = organizationId
+          ? await Organization.findById(organizationId).lean()
+          : req.organization || {};
+        return sendAdmissionSms(updated, organization || {});
+      }).catch((error) => console.error("Quick tenant admission SMS failed:", error.message));
+    }
 
     return res.json({ ok: true, form: updated });
   } catch (err) {
