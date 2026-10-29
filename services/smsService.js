@@ -159,8 +159,27 @@ async function sendTenantLoginOtp({ tenant = {}, code }) {
   return sendSms({
     to: tenant.phoneNo,
     message,
-    templateId: process.env.SMS_TEMPLATE_TENANT_OTP_ID,
-    variables: { name, otp: String(code), brand: smsBrandName() },
+    templateId: process.env.SMS_TEMPLATE_TENANT_OTP_ID || process.env.SMS_TEMPLATE_OTP_LOGIN,
+    variables: { name, otp: String(code), OTP: String(code), brand: smsBrandName() },
+  });
+}
+
+async function sendBusinessLoginOtp({ to, code }) {
+  const message = `Your ${process.env.SMS_BRAND_NAME || "EazyRent"} sign-in code is ${code}. It expires in 5 minutes. Do not share this code.`;
+  return sendSms({
+    to,
+    message,
+    templateId:
+      process.env.SMS_TEMPLATE_ADMIN_OTP_ID ||
+      process.env.SMS_TEMPLATE_LOGIN_OTP_ID ||
+      process.env.SMS_TEMPLATE_OTP_LOGIN ||
+      process.env.SMS_TEMPLATE_TENANT_OTP_ID,
+    variables: {
+      name: "Admin",
+      otp: String(code),
+      OTP: String(code),
+      brand: process.env.SMS_BRAND_NAME || "EazyRent",
+    },
   });
 }
 
@@ -201,6 +220,7 @@ async function sendRentReminderSms({ tenant, organization, amountDue, billingMon
 module.exports = {
   sendAdmissionSms,
   sendTenantLoginOtp,
+  sendBusinessLoginOtp,
   sendPaymentReceivedSms,
   sendRentReminderSms,
 };

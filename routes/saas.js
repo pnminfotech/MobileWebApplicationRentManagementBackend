@@ -11,6 +11,7 @@ const Subscription = require("../models/Subscription");
 const BillingTransaction = require("../models/BillingTransaction");
 const PasswordResetToken = require("../models/PasswordResetToken");
 const LoginEmailChallenge = require("../models/LoginEmailChallenge");
+const BusinessPhoneLoginChallenge = require("../models/BusinessPhoneLoginChallenge");
 const SuperadminEmailChange = require("../models/SuperadminEmailChange");
 const Room = require("../models/Room");
 const Form = require("../models/formModels");
@@ -64,6 +65,7 @@ const {
   sendSuperadminEmailChangeCode,
   sendSuperadminEmailChangedNotice,
 } = require("../services/emailService");
+const { sendBusinessLoginOtp } = require("../services/smsService");
 const {
   notifyOrganization,
   notifySuperadmins,
@@ -100,6 +102,12 @@ const loginCodeVerifyIpLimit = createAuthRateLimit({ name: "login-code-verify-ip
 const loginCodeVerifyChallengeLimit = createAuthRateLimit({ name: "login-code-verify-challenge", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: challengeIdentifier });
 const loginCodeResendIpLimit = createAuthRateLimit({ name: "login-code-resend-ip", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
 const loginCodeResendChallengeLimit = createAuthRateLimit({ name: "login-code-resend-challenge", windowMs: 15 * 60 * 1000, max: 2, keyFromRequest: challengeIdentifier, countSuccessfulRequests: true });
+const phoneLoginRequestIpLimit = createAuthRateLimit({ name: "phone-login-request-ip", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
+const phoneLoginRequestPhoneLimit = createAuthRateLimit({ name: "phone-login-request-phone", windowMs: 60 * 60 * 1000, max: 5, keyFromRequest: (req) => normalizeBusinessPhone(req.body?.phone), countSuccessfulRequests: true });
+const phoneLoginVerifyIpLimit = createAuthRateLimit({ name: "phone-login-verify-ip", windowMs: 15 * 60 * 1000, max: 20, keyFromRequest: requestIp });
+const phoneLoginVerifyChallengeLimit = createAuthRateLimit({ name: "phone-login-verify-challenge", windowMs: 15 * 60 * 1000, max: 10, keyFromRequest: challengeIdentifier });
+const phoneLoginResendIpLimit = createAuthRateLimit({ name: "phone-login-resend-ip", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
+const phoneLoginResendChallengeLimit = createAuthRateLimit({ name: "phone-login-resend-challenge", windowMs: 15 * 60 * 1000, max: 2, keyFromRequest: challengeIdentifier, countSuccessfulRequests: true });
 const loginPinVerifyIpLimit = createAuthRateLimit({ name: "login-pin-verify-ip", windowMs: 15 * 60 * 1000, max: 10, keyFromRequest: requestIp });
 const loginPinVerifyChallengeLimit = createAuthRateLimit({ name: "login-pin-verify-challenge", windowMs: 15 * 60 * 1000, max: 5, keyFromRequest: challengeIdentifier });
 const emailChangeStartIpLimit = createAuthRateLimit({ name: "superadmin-email-change-start-ip", windowMs: 60 * 60 * 1000, max: 5, keyFromRequest: requestIp, countSuccessfulRequests: true });
@@ -133,7 +141,7 @@ function publicUser(user) {
     id: String(user._id),
     name: user.name,
     loginId: user.loginId || "",
-    email: user.email,
+    email: String(user.email || "").endsWith("@phone-login.invalid") ? "" : user.email,
     phone: user.phone,
     role: user.role,
     status: user.status,
@@ -175,6 +183,127 @@ function maskedEmail(email) {
   return `${local.slice(0, 1)}***@${domain}`;
 }
 
+function normalizeBusinessPhone(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  const phone = digits.startsWith("91") && digits.length === 12
+    ? digits.slice(2)
+    : digits.startsWith("0") && digits.length === 11
+      ? digits.slice(1)
+      : digits;
+  return /^[6-9]\d{9}$/.test(phone) ? phone : "";
+}
+
+function businessPhoneVariants(phone) {
+  return [phone, `+91${phone}`, `91${phone}`, `0${phone}`];
+}
+
+function maskedPhone(phone) {
+  return `******${String(phone || "").slice(-4)}`;
+}
+
+function hashPhoneLoginCode(challengeId, code) {
+  return crypto
+    .createHmac("sha256", getJwtSecret())
+    .update(`${challengeId}:${code}`)
+    .digest("hex");
+}
+
+async function findUsersByPhone(phone) {
+  return SystemUser.find({ phone: { $in: businessPhoneVariants(phone) } });
+}
+
+async function createPhoneTrialAccount(phone) {
+  const now = new Date();
+  const trialEndsAt = addDays(now, 15);
+  const units = normalizeUnits({});
+  const businessName = "New Business";
+  const ownerName = "Owner";
+  const internalEmail = `phone-${phone}@phone-login.invalid`;
+  const organization = await Organization.create({
+    name: businessName,
+    slug: await uniqueSlug(`${businessName}-${phone}`),
+    businessType: "mixed",
+    ownerName,
+    phone,
+    unitAllocation: units,
+    onboardingMode: "flexible",
+    features: { canteenEnabled: false },
+    status: "active",
+    activatedAt: now,
+  });
+
+  let user;
+  let subscription;
+  try {
+    user = await SystemUser.create({
+      organizationId: organization._id,
+      name: ownerName,
+      email: internalEmail,
+      phone,
+      role: "system_admin",
+      status: "active",
+    });
+    organization.createdBy = user._id;
+    await organization.save();
+
+    subscription = await Subscription.create({
+      organizationId: organization._id,
+      status: "active",
+      startDate: now,
+      endDate: trialEndsAt,
+      durationMonths: 1,
+      units,
+      currency: "INR",
+      amount: 0,
+      pricing: { subtotal: 0, payableAmount: 0 },
+    });
+
+    await Promise.allSettled([
+      notifySuperadmins({
+        type: "registration",
+        title: "New trial account registered",
+        message: `A new phone-based trial account was created. Trial is active until ${trialEndsAt.toLocaleDateString("en-IN")}.`,
+        actionUrl: `/superadmin/organization-detail?id=${organization._id}`,
+        priority: "normal",
+        entityType: "organization",
+        entityId: organization._id,
+        actionType: "registration",
+        expiresAt: addDays(new Date(), 30),
+        payload: {
+          organizationId: String(organization._id),
+          subscriptionId: String(subscription._id),
+          trial: true,
+          trialEndsAt,
+        },
+      }),
+      notifyOrganization(organization._id, {
+        type: "registration",
+        title: "Trial account created",
+        message: "Your 15-day trial is active. Select your property types to get started, then complete your business profile.",
+        priority: "normal",
+        entityType: "subscription",
+        entityId: subscription._id,
+        actionType: "trial_started",
+        expiresAt: trialEndsAt,
+        payload: {
+          subscriptionId: String(subscription._id),
+          trial: true,
+          trialEndsAt,
+        },
+      }),
+    ]);
+
+    return { user, organization };
+  } catch (error) {
+    await Promise.all([
+      subscription ? Subscription.deleteOne({ _id: subscription._id }) : Promise.resolve(),
+      user ? SystemUser.deleteOne({ _id: user._id }) : Promise.resolve(),
+      Organization.deleteOne({ _id: organization._id }),
+    ]);
+    throw error;
+  }
+}
+
 async function deliverSuperadminLoginCode(user, code) {
   try {
     await sendLoginEmailCode({ to: user.email, name: user.name, code, expiresMinutes: 10 });
@@ -197,6 +326,9 @@ async function startEmailLoginChallenge(req, res) {
     $or: [{ email: login }, { loginId: login }],
   });
   if (!user) return res.status(400).json({ message: "No account was found for this email." });
+  if (user.role === "system_admin") {
+    return res.status(410).json({ message: "Business accounts now sign in with a mobile OTP." });
+  }
   if (user.status === "suspended") return res.status(403).json({ message: "Account suspended" });
 
   if (!passRateLimits(req, res, [loginCodeSendIpLimit, loginCodeSendAccountLimit])) return null;
@@ -228,6 +360,21 @@ async function startEmailLoginChallenge(req, res) {
     email: maskedEmail(user.email),
     expiresInMinutes: 10,
   });
+}
+
+async function sendPhoneLoginCode(phone, challengeId) {
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+  const id = challengeId || new mongoose.Types.ObjectId();
+  const now = new Date();
+  const challenge = await BusinessPhoneLoginChallenge.create({
+    _id: id,
+    phone,
+    codeHash: hashPhoneLoginCode(id, code),
+    codeExpiresAt: new Date(now.getTime() + 5 * 60 * 1000),
+    resendAvailableAt: new Date(now.getTime() + 5 * 60 * 1000),
+    expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000),
+  });
+  return { challenge, code };
 }
 
 function publicResetUrl(req, token) {
@@ -632,6 +779,9 @@ router.post("/auth/login", loginIpLimit, loginAccountLimit, async (req, res) => 
       $or: [{ email: login }, { loginId: login }],
     }).select("+password");
     if (!user) return res.status(400).json({ message: "Invalid credentials" });
+    if (user.role === "system_admin") {
+      return res.status(410).json({ message: "Business accounts now sign in with a mobile OTP." });
+    }
 
     const ok = await user.comparePassword(password);
     if (!ok) return res.status(400).json({ message: "Invalid credentials" });
@@ -704,6 +854,235 @@ router.post("/auth/login/request-email-code", loginIpLimit, loginAccountLimit, a
   } catch (err) {
     console.error("email login request error:", err?.message || err);
     return res.status(500).json({ message: "Unable to send the verification code. Please try again." });
+  }
+});
+
+router.post("/auth/login/request-phone-code", phoneLoginRequestIpLimit, phoneLoginRequestPhoneLimit, async (req, res) => {
+  try {
+    const phone = normalizeBusinessPhone(req.body?.phone);
+    if (!phone) return res.status(400).json({ message: "Enter a valid 10-digit mobile number." });
+    if (!passRateLimits(req, res, [loginCodeSendIpLimit])) return;
+
+    const matchingUsers = await findUsersByPhone(phone);
+    if (matchingUsers.some((user) => user.role === "superadmin")) {
+      return res.status(400).json({ message: "Use the superadmin email sign-in option." });
+    }
+    if (matchingUsers.filter((user) => user.role === "system_admin").length > 1) {
+      return res.status(409).json({ message: "This mobile number is linked to multiple accounts. Contact support." });
+    }
+
+    const now = new Date();
+    const activeChallenge = await BusinessPhoneLoginChallenge.findOne({
+      phone,
+      usedAt: null,
+      expiresAt: { $gt: now },
+    }).sort({ createdAt: -1 });
+    if (activeChallenge) {
+      const resendAvailableAt = activeChallenge.resendAvailableAt || activeChallenge.codeExpiresAt || activeChallenge.expiresAt;
+      if (resendAvailableAt > now) {
+        const retryAfterSeconds = Math.ceil((resendAvailableAt.getTime() - now.getTime()) / 1000);
+        res.setHeader("Retry-After", String(retryAfterSeconds));
+        return res.status(429).json({
+          message: "Please wait until the 5-minute OTP timer ends before requesting another code.",
+          resendAvailableAt,
+        });
+      }
+    }
+
+    await BusinessPhoneLoginChallenge.updateMany(
+      { phone, usedAt: null },
+      { $set: { usedAt: now } }
+    );
+    const { challenge, code } = await sendPhoneLoginCode(phone);
+    let delivery;
+    try {
+      delivery = await sendBusinessLoginOtp({ to: phone, code });
+    } catch (error) {
+      await BusinessPhoneLoginChallenge.updateOne(
+        { _id: challenge._id, usedAt: null },
+        { $set: { usedAt: new Date() } }
+      );
+      console.error("business login SMS delivery failed:", error?.message || error);
+      return res.status(503).json({ message: "Unable to send the OTP. Check the SMS provider configuration and try again." });
+    }
+    if (!delivery?.sent) {
+      await BusinessPhoneLoginChallenge.updateOne(
+        { _id: challenge._id, usedAt: null },
+        { $set: { usedAt: new Date() } }
+      );
+      return res.status(503).json({ message: "SMS delivery is not configured. Please contact support." });
+    }
+
+    return res.json({
+      challengeId: String(challenge._id),
+      phone: maskedPhone(phone),
+      expiresInMinutes: 5,
+      resendAvailableAt: challenge.resendAvailableAt,
+    });
+  } catch (error) {
+    console.error("phone login request error:", error?.message || error);
+    return res.status(500).json({ message: "Unable to send the OTP. Please try again." });
+  }
+});
+
+router.post("/auth/login/verify-phone-code", phoneLoginVerifyIpLimit, phoneLoginVerifyChallengeLimit, async (req, res) => {
+  try {
+    const challengeId = String(req.body?.challengeId || "").trim();
+    const code = String(req.body?.code || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(challengeId) || !/^\d{6}$/.test(code)) {
+      return res.status(400).json({ message: "The OTP is invalid or expired. Request a new code and try again." });
+    }
+
+    const challenge = await BusinessPhoneLoginChallenge.findOne({
+      _id: challengeId,
+      usedAt: null,
+      attempts: { $lt: 3 },
+      $or: [
+        { codeExpiresAt: { $gt: new Date() } },
+        { codeExpiresAt: null, expiresAt: { $gt: new Date() } },
+      ],
+    });
+    if (!challenge) {
+      const exhaustedChallenge = await BusinessPhoneLoginChallenge.findOne({
+        _id: challengeId,
+        usedAt: null,
+        attempts: { $gte: 3 },
+      }).select("resendAvailableAt codeExpiresAt expiresAt");
+      if (exhaustedChallenge) {
+        return res.status(429).json({ message: "Too many incorrect OTP attempts. You can request a new code when the 5-minute timer ends." });
+      }
+      return res.status(400).json({ message: "The OTP is invalid or expired. Request a new code and try again." });
+    }
+
+    const expectedHash = hashPhoneLoginCode(challenge._id, code);
+    const matches = crypto.timingSafeEqual(
+      Buffer.from(challenge.codeHash, "hex"),
+      Buffer.from(expectedHash, "hex")
+    );
+    if (!matches) {
+      const updatedChallenge = await BusinessPhoneLoginChallenge.findOneAndUpdate(
+        { _id: challenge._id, codeHash: challenge.codeHash, usedAt: null, attempts: { $lt: 3 } },
+        { $inc: { attempts: 1 } },
+        { new: true }
+      );
+      return res.status(updatedChallenge?.attempts >= 3 ? 429 : 400).json({
+        message: updatedChallenge?.attempts >= 3
+          ? "Too many incorrect OTP attempts. You can request a new code when the 5-minute timer ends."
+          : "The OTP is incorrect. Check the code and try again.",
+      });
+    }
+
+    const consumed = await BusinessPhoneLoginChallenge.findOneAndUpdate(
+      {
+        _id: challenge._id,
+        codeHash: expectedHash,
+        usedAt: null,
+        attempts: { $lt: 3 },
+        $or: [
+          { codeExpiresAt: { $gt: new Date() } },
+          { codeExpiresAt: null, expiresAt: { $gt: new Date() } },
+        ],
+      },
+      { $set: { usedAt: new Date() }, $inc: { attempts: 1 } },
+      { new: true }
+    );
+    if (!consumed) return res.status(400).json({ message: "Sign-in request expired. Please start again." });
+
+    const matchingUsers = await findUsersByPhone(consumed.phone);
+    if (matchingUsers.some((user) => user.role === "superadmin")) {
+      return res.status(403).json({ message: "Use the superadmin email sign-in option." });
+    }
+    const businessUsers = matchingUsers.filter((user) => user.role === "system_admin");
+    if (businessUsers.length > 1) {
+      return res.status(409).json({ message: "This mobile number is linked to multiple accounts. Contact support." });
+    }
+
+    let user = businessUsers[0];
+    let organization;
+    if (user?.status === "suspended") return res.status(403).json({ message: "Account suspended." });
+    if (!user) {
+      const created = await createPhoneTrialAccount(consumed.phone);
+      user = created.user;
+      organization = created.organization;
+    } else {
+      organization = user.organizationId
+        ? await Organization.findById(user.organizationId)
+        : null;
+      if (!organization) return res.status(403).json({ message: "Organization account not found. Contact support." });
+    }
+
+    const now = new Date();
+    user.lastLoginAt = now;
+    if (String(req.get("X-Platform") || "web").toLowerCase() !== "mobile") user.lastWebActivityAt = now;
+    await user.save();
+
+    return res.json({
+      token: signSystemToken(user, req.get("X-Platform")),
+      user: publicUser(user),
+      organization,
+    });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({ message: "This mobile number already has an account. Please request a fresh OTP." });
+    }
+    console.error("phone login verification error:", error?.message || error);
+    return res.status(500).json({ message: "Unable to verify the OTP. Please try again." });
+  }
+});
+
+router.post("/auth/login/resend-phone-code", phoneLoginResendIpLimit, phoneLoginResendChallengeLimit, async (req, res) => {
+  try {
+    const challengeId = String(req.body?.challengeId || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(challengeId)) {
+      return res.status(400).json({ message: "Sign-in request expired. Start again." });
+    }
+    const challenge = await BusinessPhoneLoginChallenge.findOne({
+      _id: challengeId,
+      usedAt: null,
+      expiresAt: { $gt: new Date() },
+      resendCount: { $lt: 2 },
+    });
+    if (!challenge) return res.status(400).json({ message: "Sign-in request expired. Start again." });
+    const now = new Date();
+    const resendAvailableAt = challenge.resendAvailableAt || challenge.codeExpiresAt || challenge.expiresAt;
+    if (resendAvailableAt > now) {
+      const retryAfterSeconds = Math.ceil((resendAvailableAt.getTime() - now.getTime()) / 1000);
+      res.setHeader("Retry-After", String(retryAfterSeconds));
+      return res.status(429).json({
+        message: "Please wait until the 5-minute OTP timer ends before requesting another code.",
+        resendAvailableAt,
+      });
+    }
+
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+    challenge.codeHash = hashPhoneLoginCode(challenge._id, code);
+    challenge.codeExpiresAt = new Date(now.getTime() + 5 * 60 * 1000);
+    challenge.resendAvailableAt = new Date(now.getTime() + 5 * 60 * 1000);
+    challenge.attempts = 0;
+    challenge.resendCount += 1;
+    await challenge.save();
+    let delivery;
+    try {
+      delivery = await sendBusinessLoginOtp({ to: challenge.phone, code });
+    } catch (error) {
+      challenge.usedAt = new Date();
+      await challenge.save();
+      console.error("business login SMS resend failed:", error?.message || error);
+      return res.status(503).json({ message: "Unable to send the OTP. Check the SMS provider configuration and try again." });
+    }
+    if (!delivery?.sent) {
+      challenge.usedAt = new Date();
+      await challenge.save();
+      return res.status(503).json({ message: "Unable to send the OTP. Check the SMS provider configuration and try again." });
+    }
+    return res.json({
+      phone: maskedPhone(challenge.phone),
+      expiresInMinutes: 5,
+      resendAvailableAt: challenge.resendAvailableAt,
+    });
+  } catch (error) {
+    console.error("phone login resend error:", error?.message || error);
+    return res.status(500).json({ message: "Unable to resend the OTP. Please try again." });
   }
 });
 
@@ -1255,6 +1634,35 @@ router.get("/me", requireSystemAuth, async (req, res) => {
   });
 });
 
+router.put("/app/profile", requireSystemAuth, requireRole("system_admin"), async (req, res) => {
+  try {
+    if (!req.organizationId || !req.organization) {
+      return res.status(403).json({ message: "Organization required." });
+    }
+
+    const businessName = String(req.body?.businessName || "").trim();
+    const ownerName = String(req.body?.ownerName || "").trim();
+    if (!businessName || !ownerName) {
+      return res.status(400).json({ message: "Business name and owner name are required." });
+    }
+    if (businessName.length > 120 || ownerName.length > 120) {
+      return res.status(400).json({ message: "Business name and owner name must be 120 characters or fewer." });
+    }
+
+    req.organization.name = businessName;
+    req.organization.ownerName = ownerName;
+    req.systemUser.name = ownerName;
+    await Promise.all([req.organization.save(), req.systemUser.save()]);
+    return res.json({
+      organization: req.organization,
+      user: publicUser(req.systemUser),
+    });
+  } catch (error) {
+    console.error("business profile update error:", error?.message || error);
+    return res.status(500).json({ message: "Unable to update your business profile." });
+  }
+});
+
 router.use("/app/owner-documents", requireSystemAuth, requireRole("system_admin"), requireActiveOrganization, require("./ownerDocuments"));
 
 router.get("/app/bootstrap", requireSystemAuth, async (req, res) => {
@@ -1412,9 +1820,38 @@ router.put("/onboarding/property-types", requireSystemAuth, requireRole("system_
     if (required.some((type) => !types.includes(type))) return res.status(400).json({ message: "Property types with existing units or allocated capacity must remain selected." });
     req.organization.selectedPropertyTypes = [...new Set(types)];
     req.organization.businessType = types.length === 1 ? ({ bed: "hostel", room: "rooms", shop: "shops" }[types[0]]) : "mixed";
+    if (!req.organization.features) req.organization.features = {};
+    if (types.includes("bed")) {
+      req.organization.features.canteenEnabled = Boolean(req.body?.canteenEnabled);
+    } else {
+      req.organization.features.canteenEnabled = false;
+    }
     await req.organization.save();
     res.json({ organization: req.organization });
   } catch (err) { res.status(500).json({ message: "Unable to save property types." }); }
+});
+
+router.put("/app/canteen-feature", requireSystemAuth, requireRole("system_admin"), requireActiveOrganization, async (req, res) => {
+  try {
+    const enabled = req.body?.canteenEnabled;
+    if (typeof enabled !== "boolean") return res.status(400).json({ message: "Choose whether the canteen feature should be enabled." });
+    const hasHostel = req.organization.onboardingMode === "flexible"
+      ? (req.organization.selectedPropertyTypes || []).includes("bed")
+      : Number(req.organization.unitAllocation?.beds || 0) > 0;
+    if (enabled && !hasHostel) return res.status(400).json({ message: "Select the hostel property type before enabling canteen." });
+
+    if (!req.organization.features) req.organization.features = {};
+    req.organization.features.canteenEnabled = enabled;
+    await req.organization.save();
+    res.json({
+      enabled,
+      organization: req.organization,
+      message: enabled ? "Canteen feature enabled." : "Canteen feature disabled. Your saved canteen settings have been kept.",
+    });
+  } catch (err) {
+    console.error("canteen feature update error:", err);
+    res.status(500).json({ message: "Unable to update canteen feature." });
+  }
 });
 
 router.put("/onboarding/unit-counts", requireSystemAuth, requireRole("system_admin"), async (req, res) => {
@@ -1809,7 +2246,7 @@ router.post(
         await req.organization.save();
         if (req.organization.onboardingMode !== "flexible") await ensureReservedUnits(req.organizationId, trialNewUnits);
         return res.json({
-          message: "Trial units added. Payment will be calculated when the trial ends.",
+          message: "Trial unit capacity added for free. Paid upgrade pricing applies only after a paid subscription is active.",
           subscription: currentSubscription,
           trialUpgrade: true,
           upgrade: { currentUnits: trialCurrentUnits, addedUnits: trialAddedUnits, newUnits: trialNewUnits, amount: 0, currency: "INR" },
@@ -1941,128 +2378,7 @@ router.post(
 );
 
 router.post("/register", registrationIpLimit, async (req, res) => {
-  try {
-    const businessName = String(req.body?.businessName || req.body?.organizationName || "").trim();
-    const ownerName = String(req.body?.ownerName || req.body?.name || "").trim();
-    const loginId = String(req.body?.loginId || req.body?.username || req.body?.email || "").trim().toLowerCase();
-    const email = String(req.body?.email || "").trim().toLowerCase() || `${loginId}@trial.local`;
-    const password = String(req.body?.password || "");
-
-    if (!businessName || !ownerName || !loginId || !password) {
-      return res.status(400).json({
-        message: "businessName, ownerName, loginId and password are required",
-      });
-    }
-
-    if (password.length < 8) {
-      return res.status(400).json({ message: "Password must be at least 8 characters" });
-    }
-
-    const existingUser = await SystemUser.exists({
-      $or: [{ loginId }, { email }],
-    });
-    if (existingUser) return res.status(409).json({ message: "Login ID or email already registered" });
-
-    const units = normalizeUnits({});
-    const now = new Date();
-    const trialEndsAt = addDays(now, 15);
-    const slug = await uniqueSlug(businessName);
-
-    const organization = await Organization.create({
-      name: businessName,
-      slug,
-      businessType: "mixed",
-      ownerName,
-      email,
-      phone: req.body?.phone || "",
-      address: req.body?.address || "",
-      unitAllocation: units,
-      onboardingMode: "flexible",
-      features: {
-        canteenEnabled: false,
-      },
-      status: "active",
-      activatedAt: now,
-    });
-
-    const user = await SystemUser.create({
-      organizationId: organization._id,
-      name: ownerName,
-      loginId,
-      email,
-      phone: req.body?.phone || "",
-      password,
-      role: "system_admin",
-      status: "active",
-    });
-
-    organization.createdBy = user._id;
-    await organization.save();
-
-    const subscription = await Subscription.create({
-      organizationId: organization._id,
-      status: "active",
-      startDate: now,
-      endDate: trialEndsAt,
-      durationMonths: 1,
-      units,
-      currency: "INR",
-      amount: 0,
-      pricing: {
-        subtotal: 0,
-        payableAmount: 0,
-      },
-    });
-
-    await Promise.allSettled([
-      notifySuperadmins({
-        type: "registration",
-        title: "New trial account registered",
-        message: `${businessName} registered by ${ownerName}. Trial is active until ${trialEndsAt.toLocaleDateString("en-IN")}.`,
-        actionUrl: `/superadmin/organization-detail?id=${organization._id}`,
-        priority: "normal",
-        entityType: "organization",
-        entityId: organization._id,
-        actionType: "registration",
-        expiresAt: addDays(new Date(), 30),
-        payload: {
-          organizationId: String(organization._id),
-          subscriptionId: String(subscription._id),
-          trial: true,
-          trialEndsAt,
-        },
-      }),
-      notifyOrganization(organization._id, {
-        type: "registration",
-        title: "Trial account created",
-        message: `Welcome ${ownerName}. Your 15-day trial is active. Log in and select your property types to get started.`,
-        priority: "normal",
-        entityType: "subscription",
-        entityId: subscription._id,
-        actionType: "trial_started",
-        expiresAt: trialEndsAt,
-        payload: {
-          subscriptionId: String(subscription._id),
-          trial: true,
-          trialEndsAt,
-        },
-      }),
-    ]);
-
-    res.status(201).json({
-      organization,
-      user: publicUser(user),
-      subscription,
-      trialEndsAt,
-      message: "Registration created. Login to start your 15-day trial.",
-    });
-  } catch (err) {
-    if (err?.code === 11000) {
-      return res.status(409).json({ message: "Duplicate organization or email" });
-    }
-    console.error("saas register error:", err);
-    res.status(500).json({ message: "Server error" });
-  }
+  return res.status(410).json({ message: "Business registration is no longer available. Sign in with your mobile number." });
 });
 
 router.post("/referrals/quote", requireSystemAuth, async (req, res) => {
@@ -2227,6 +2543,34 @@ router.delete(
     } catch (err) {
       console.error("delete referral error:", err);
       res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+router.get(
+  "/admin/system-users",
+  requireSystemAuth,
+  requireRole("superadmin"),
+  async (req, res) => {
+    try {
+      const users = await SystemUser.find({ role: "system_admin" })
+        .select("_id organizationId name email phone role status lastLoginAt createdAt updatedAt")
+        .sort({ createdAt: -1 })
+        .lean();
+
+      const organizationIds = [...new Set(users.map((user) => String(user.organizationId || "")).filter(Boolean))];
+      const organizations = await Organization.find({ _id: { $in: organizationIds } })
+        .select("_id name ownerName email phone status createdAt")
+        .lean();
+      const organizationById = new Map(organizations.map((organization) => [String(organization._id), organization]));
+
+      res.json(users.map((user) => ({
+        ...user,
+        organization: organizationById.get(String(user.organizationId)) || null,
+      })));
+    } catch (err) {
+      console.error("admin system users error:", err);
+      res.status(500).json({ message: "Unable to load system-admin users." });
     }
   }
 );

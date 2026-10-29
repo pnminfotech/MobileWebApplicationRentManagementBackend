@@ -183,7 +183,7 @@ const organizationSchema = new mongoose.Schema(
       default: "mixed",
     },
     ownerName: { type: String, required: true, trim: true },
-    email: { type: String, required: true, trim: true, lowercase: true },
+    email: { type: String, trim: true, lowercase: true, default: "" },
     phone: { type: String, trim: true, default: "" },
     address: { type: String, trim: true, default: "" },
     // Identity files are returned only by the authenticated owner-documents API.

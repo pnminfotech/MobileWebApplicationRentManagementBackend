@@ -13,7 +13,7 @@ const systemUserSchema = new mongoose.Schema(
     loginId: { type: String, trim: true, lowercase: true, unique: true, sparse: true },
     email: { type: String, required: true, trim: true, lowercase: true, unique: true },
     phone: { type: String, trim: true, default: "" },
-    password: { type: String, required: true, select: false },
+    password: { type: String, select: false },
     // Separate short PIN used only to confirm high-risk Super Admin actions.
     securityPin: { type: String, select: false, default: null },
     securityPinLoginAttempts: { type: Number, default: 0 },
@@ -45,6 +45,7 @@ systemUserSchema.pre("save", async function hashPassword(next) {
 });
 
 systemUserSchema.methods.comparePassword = function comparePassword(candidate) {
+  if (!this.password) return Promise.resolve(false);
   return bcrypt.compare(candidate, this.password);
 };
 
