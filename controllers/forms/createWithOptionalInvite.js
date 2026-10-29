@@ -156,7 +156,7 @@ async function createFormWithSrNo(req, rest, session) {
   const payload = { ...rest };
   delete payload.srNo;
 
-  const nextSr = await assignNextSrNoAndUpdateCounter();
+  const nextSr = await assignNextSrNoAndUpdateCounter(req.organizationId);
   payload.srNo = Number(nextSr);
 
   const scopedPayload = scopedCreate(req, payload);

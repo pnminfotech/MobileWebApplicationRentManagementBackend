@@ -1,7 +1,8 @@
 const Organization = require("../models/Organization");
 const Room = require("../models/Room");
 const Subscription = require("../models/Subscription");
-const { isPastDate } = require("./subscriptionLifecycle");
+const { isPastDate, getSubscriptionReadOnlyAccess } = require("./subscriptionLifecycle");
+const { INTRODUCTORY_UNIT_LIMIT, totalUnits } = require("./trialUnitPolicy");
 
 const reservationLocks = new Map();
 
@@ -111,7 +112,7 @@ async function ensureReservedUnits(organizationId, allocation = {}) {
 }
 
 async function getUnitQuota(organizationId) {
-  const [organization, subscription] = await Promise.all([
+  const [organization, activeSubscription] = await Promise.all([
     Organization.findById(organizationId).lean(),
     Subscription.findOne({ organizationId, status: "active" })
       .sort({ createdAt: -1 })
@@ -124,13 +125,17 @@ async function getUnitQuota(organizationId) {
     throw err;
   }
 
-  if (!subscription) {
+  const subscription = activeSubscription || await Subscription.findOne({ organizationId, status: "expired" })
+    .sort({ createdAt: -1 })
+    .lean();
+  const readOnly = getSubscriptionReadOnlyAccess(organization, subscription).readOnly;
+  if (!subscription || (subscription.status !== "active" && !readOnly)) {
     const err = new Error("Active subscription required");
     err.status = 402;
     throw err;
   }
 
-  if (isPastDate(subscription.endDate)) {
+  if (isPastDate(subscription.endDate) && !readOnly) {
     const err = new Error("Subscription expired");
     err.status = 402;
     throw err;
@@ -139,8 +144,9 @@ async function getUnitQuota(organizationId) {
   const limits = normalizeAllocation(
     subscription.units || organization.unitAllocation
   );
-  await ensureReservedUnits(organizationId, limits);
+  if (organization.onboardingMode !== "flexible" && !readOnly) await ensureReservedUnits(organizationId, limits);
   const usage = await getUnitUsage(organizationId);
+  const introductory = organization.onboardingMode === "flexible" && !organization.unitCountsConfigured && !subscription.planId && Number(subscription.amount || 0) === 0;
   const remaining = {
     beds: Math.max(0, limits.beds - usage.beds),
     rooms: Math.max(0, limits.rooms - usage.rooms),
@@ -151,13 +157,47 @@ async function getUnitQuota(organizationId) {
     limits,
     usage,
     remaining,
+    readOnly,
     subscriptionId: subscription._id,
+    introductory,
+    introductoryLimit: introductory ? INTRODUCTORY_UNIT_LIMIT : null,
+    introductoryRemaining: introductory ? Math.max(0, INTRODUCTORY_UNIT_LIMIT - totalUnits(usage)) : null,
+    selectedPropertyTypes: organization.onboardingMode === "flexible" ? organization.selectedPropertyTypes || [] : null,
   };
 }
 
 async function assertUnitCapacity(organizationId, requested = {}) {
   const quota = await getUnitQuota(organizationId);
+  if (quota.readOnly) {
+    const err = new Error("Your subscription has ended. Purchase a plan to add units.");
+    err.status = 403;
+    err.code = "TRIAL_READ_ONLY";
+    throw err;
+  }
   const increments = normalizeAllocation(requested);
+
+  if (quota.selectedPropertyTypes) {
+    const mapping = { beds: "bed", rooms: "room", shops: "shop" };
+    const disallowed = Object.keys(requested).some((key) => mapping[key] && !quota.selectedPropertyTypes.includes(mapping[key]));
+    if (disallowed) {
+      const err = new Error("Select this property type in Profile before adding units.");
+      err.status = 403;
+      err.code = "UNIT_LIMIT_EXCEEDED";
+      err.details = quota;
+      throw err;
+    }
+  }
+
+  if (quota.introductory) {
+    if (totalUnits(quota.usage) + totalUnits(increments) > INTRODUCTORY_UNIT_LIMIT) {
+      const err = new Error("You have reached the 10-unit trial allowance. Set your unit counts in Profile to add more units.");
+      err.status = 403;
+      err.code = "UNIT_LIMIT_EXCEEDED";
+      err.details = quota;
+      throw err;
+    }
+    return quota;
+  }
 
   for (const key of ["beds", "rooms", "shops"]) {
     if (quota.usage[key] + increments[key] > quota.limits[key]) {

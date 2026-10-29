@@ -61,7 +61,7 @@ async function grantReferralRewardFromTransaction(transaction) {
     return null;
   }
 
-  const coins = Number(transaction.pricing.referralRewardCoins || defaultRewardCoins());
+  const coins = Number(transaction.pricing.referralRewardCoins ?? defaultRewardCoins());
   const rewardCoins = Number.isFinite(coins) && coins >= 0 ? Math.round(coins) : defaultRewardCoins();
   const referral = await ReferralCode.findOneAndUpdate(
     { code: referralCode, ownerOrganizationId },

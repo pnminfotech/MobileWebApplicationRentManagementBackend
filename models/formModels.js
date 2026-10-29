@@ -92,7 +92,7 @@ const formSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
-    srNo: { type: Number, unique: true, required: true },
+    srNo: { type: Number, required: true },
 
     name: { type: String, required: true },
     joiningDate: { type: Date, required: true },
@@ -125,6 +125,11 @@ const formSchema = new mongoose.Schema(
       enum: ["submitted", "pending_tenant"],
       default: "submitted",
       index: true,
+    },
+    pendingAssignmentOrigin: {
+      type: String,
+      enum: ["", "quick_add", "returning_tenant"],
+      default: "",
     },
 
     // ⛔ removed address text fields for relatives as per your request
@@ -326,6 +331,76 @@ firstRentMonth: { type: String }, // e.g. "Jan-26"
 );
 
 formSchema.index({ organizationId: 1, roomNo: 1, bedNo: 1, leaveDate: 1 });
+formSchema.index({ organizationId: 1, srNo: 1 }, { unique: true, name: "organization_srno_unique" });
 formSchema.index({ organizationId: 1, createdAt: -1 });
+
+// Keep a separate stay record so unit history survives tenant moves and removal.
+const { syncUnitStay } = require("../services/unitHistory");
+const historyFields = new Set([
+  "roomId", "roomNo", "bedNo", "propertyType", "category", "wingName", "floorNo",
+  "intakeStatus", "leaveDate", "shiftEffectiveFrom", "name", "phoneNo", "baseRent", "depositAmount", "joiningDate",
+  "address", "houseNo", "nearbyPlace", "city", "state", "pincode", "firstRentStatus", "shopName", "shopBusiness", "familyMembers",
+  "dob", "relative1Relation", "relative1Name", "relative1Phone", "relative2Relation", "relative2Name", "relative2Phone", "companyAddress", "hasCanteen",
+  "srNo", "dateOfJoiningCollege", "relativeAddress1", "relativeAddress2", "canteenPlanType", "canteenStartDate", "canteenMonthlyAmount", "canteenIncludedMeals", "canteenMealPrices",
+]);
+const trackUpdate = (update = {}) => Object.entries(update).some(([key, value]) => {
+  if (key.startsWith("$") && value && typeof value === "object") {
+    return Object.keys(value).some((field) => historyFields.has(field.split(".")[0]));
+  }
+  return historyFields.has(key.split(".")[0]);
+});
+const reportHistoryError = (error) => console.error("Unable to update unit history:", error.message);
+
+formSchema.pre("save", async function () {
+  this.$locals.trackUnitHistory = this.isNew || [...historyFields].some((field) => this.isModified(field));
+  delete this.$locals.unitHistoryBefore;
+  if (!this.$locals.trackUnitHistory || this.isNew) return;
+  try {
+    let query = this.constructor.findById(this._id).lean();
+    if (this.$session()) query = query.session(this.$session());
+    this.$locals.unitHistoryBefore = await query;
+  } catch (error) { reportHistoryError(error); }
+});
+formSchema.post("save", async function (doc) {
+  if (!doc.$locals.trackUnitHistory) return;
+  try { await syncUnitStay(doc.$locals.unitHistoryBefore || null, doc.toObject(), doc.$session()); }
+  catch (error) { reportHistoryError(error); }
+});
+formSchema.pre("findOneAndUpdate", async function () {
+  if (!trackUpdate(this.getUpdate())) return;
+  try {
+    let query = this.model.findOne(this.getQuery()).lean();
+    if (this.getOptions().session) query = query.session(this.getOptions().session);
+    this._unitHistoryBefore = await query;
+    this._trackUnitHistory = true;
+  } catch (error) { reportHistoryError(error); }
+});
+formSchema.post("findOneAndUpdate", async function (doc) {
+  if (!doc || !this._trackUnitHistory) return;
+  try {
+    let query = this.model.findById(doc._id).lean();
+    if (this.getOptions().session) query = query.session(this.getOptions().session);
+    const updated = await query;
+    if (updated) await syncUnitStay(this._unitHistoryBefore, updated, this.getOptions().session);
+  } catch (error) { reportHistoryError(error); }
+});
+formSchema.pre("deleteOne", { document: false, query: true }, async function () {
+  try {
+    let query = this.model.findOne(this.getQuery()).lean();
+    if (this.getOptions().session) query = query.session(this.getOptions().session);
+    this._unitHistoryBefore = await query;
+  }
+  catch (error) { reportHistoryError(error); }
+});
+formSchema.post("deleteOne", { document: false, query: true }, async function (result) {
+  if (!result?.deletedCount || !this._unitHistoryBefore) return;
+  try { await syncUnitStay(this._unitHistoryBefore, null, this.getOptions().session); }
+  catch (error) { reportHistoryError(error); }
+});
+formSchema.post("findOneAndDelete", async function (doc) {
+  if (!doc) return;
+  try { await syncUnitStay(typeof doc.toObject === "function" ? doc.toObject() : doc, null, this.getOptions().session); }
+  catch (error) { reportHistoryError(error); }
+});
 
 module.exports = mongoose.models.Form || mongoose.model("Form", formSchema);

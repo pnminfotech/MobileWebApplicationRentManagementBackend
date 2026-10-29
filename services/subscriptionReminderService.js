@@ -64,11 +64,14 @@ async function sendSubscriptionExpiryReminders(options = {}) {
 
     const endDate = new Date(subscription.endDate).toLocaleDateString("en-IN");
     const label = remainingDays === 0 ? "today" : `in ${remainingDays} day${remainingDays === 1 ? "" : "s"}`;
+    const isTrial = !subscription.planId && Number(subscription.amount || 0) === 0;
     await Promise.allSettled([
       notifyOrganization(organization._id, {
         type: "subscription_expiry",
         title: "Subscription expiring soon",
-        message: `Your subscription for ${organization.name} expires ${label} (${endDate}). Please renew to avoid service interruption.`,
+        message: isTrial
+          ? `Your trial for ${organization.name} ends ${label} (${endDate}). You can view and download data for one month afterward, but changes require a paid plan.`
+          : `Your subscription for ${organization.name} expires ${label} (${endDate}). Please renew to avoid service interruption.`,
         priority: remainingDays <= 3 ? "high" : "normal",
         entityType: "subscription",
         entityId: subscription._id,

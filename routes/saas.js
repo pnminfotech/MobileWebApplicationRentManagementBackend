@@ -41,10 +41,12 @@ const {
   normalizeDiscountPercent,
   applyDiscount,
   calculateSubscriptionPricing,
+  calculatePendingSubscriptionPricing,
   calculateSubscriptionAmount,
   addMonths,
 } = require("../utils/saas");
-const { ensureReservedUnits, getUnitQuota } = require("../services/unitQuota");
+const { ensureReservedUnits, getUnitQuota, getUnitUsage } = require("../services/unitQuota");
+const { allocationCoversUsage } = require("../services/trialUnitPolicy");
 const {
   normalizeReferralCode,
   ensureReferralCodeForOrganization,
@@ -68,11 +70,13 @@ const {
   resolveNotifications,
 } = require("../services/notificationService");
 const { createPaymentIntent } = require("../services/paymentProviders");
+const { checkPhonePeOrderStatus } = require("../services/phonePeService");
 const {
   expireDueSubscriptions,
   isPastDate,
   isSubscriptionUsable,
   refreshSubscriptionStateForOrganization,
+  getSubscriptionReadOnlyAccess,
 } = require("../services/subscriptionLifecycle");
 const { sendSubscriptionExpiryReminders } = require("../services/subscriptionReminderService");
 const {
@@ -316,6 +320,7 @@ function hasAnyUnit(units) {
 }
 
 function needsUnitSetupFor(subscription, organization) {
+  if (organization?.onboardingMode === "flexible") return false;
   const units = normalizeUnits(subscription?.units || organization?.unitAllocation || {});
   return !hasAnyUnit(units);
 }
@@ -396,6 +401,60 @@ async function applyWalletPricing(organizationId, amount, enabled) {
     walletDebitGranted: false,
     payableAmount: Math.max(0, originalAmount - walletCoinsUsed),
   };
+}
+
+async function isFirstPaidPendingCheckout(subscription) {
+  if (!subscription || subscription.status !== "pending_payment" ||
+      (Number(subscription.amount || 0) <= 0 && Number(subscription.pricing?.subtotal || 0) <= 0)) return false;
+  const earlierPaidPlan = await Subscription.exists({
+    organizationId: subscription.organizationId,
+    _id: { $ne: subscription._id },
+    planId: { $ne: null },
+    status: { $in: ["active", "expired", "cancelled"] },
+    createdAt: { $lt: subscription.createdAt },
+  });
+  return !earlierPaidPlan;
+}
+
+async function ensurePendingPaymentCanBeRepriced(subscription) {
+  const transactions = await BillingTransaction.find({ subscriptionId: subscription._id });
+  if (transactions.some((transaction) => transaction.status === "success")) {
+    const error = new Error("This payment has already succeeded. Refresh the page to see your active plan.");
+    error.statusCode = 409;
+    throw error;
+  }
+  for (const transaction of transactions.filter((item) => ["created", "pending"].includes(item.status))) {
+    const creatingAt = transaction.requestPayload?.intentCreatingAt;
+    const gatewayWindowMs = (Number(process.env.PHONEPE_EXPIRE_AFTER_SECONDS || 1200) + 60) * 1000;
+    if (creatingAt && Date.now() - new Date(creatingAt).getTime() < gatewayWindowMs) {
+      const error = new Error("The previous payment is still being created. Please retry after it expires.");
+      error.statusCode = 409;
+      throw error;
+    }
+    const orderId = transaction.responsePayload?.merchantOrderId || transaction.responsePayload?.merchantTransactionId;
+    if (orderId && transaction.responsePayload?.provider === "phonepe") {
+      let status;
+      try {
+        status = await checkPhonePeOrderStatus(orderId);
+      } catch (_error) {
+        const error = new Error("Could not verify the previous payment yet. Please try again shortly.");
+        error.statusCode = 503;
+        throw error;
+      }
+      if (["failed", "cancelled"].includes(status.status)) {
+        transaction.status = status.status;
+        transaction.callbackPayload = { ...(transaction.callbackPayload || {}), repriceStatusPoll: status, polledAt: new Date() };
+        await transaction.save();
+        continue;
+      }
+      const error = new Error(status.status === "success"
+        ? "The previous payment succeeded. Refresh the page to see your active plan."
+        : "The previous payment is still processing. You can change the referral code or wallet choice after it fails or expires.");
+      error.statusCode = 409;
+      throw error;
+    }
+  }
+  return transactions;
 }
 
 function calculateUpgradeAmount(plan, addedUnits, subscription, now = new Date()) {
@@ -1196,6 +1255,8 @@ router.get("/me", requireSystemAuth, async (req, res) => {
   });
 });
 
+router.use("/app/owner-documents", requireSystemAuth, requireRole("system_admin"), requireActiveOrganization, require("./ownerDocuments"));
+
 router.get("/app/bootstrap", requireSystemAuth, async (req, res) => {
   try {
     const [subscription, plans, latestTransaction] = await Promise.all([
@@ -1226,15 +1287,18 @@ router.get("/app/bootstrap", requireSystemAuth, async (req, res) => {
       }
     }
     const subscriptionStatus = subscription?.status || null;
+    const subscriptionAccess = getSubscriptionReadOnlyAccess(req.organization, subscription);
+    const unitUsage = req.organization?.onboardingMode === "flexible" ? await getUnitUsage(req.organizationId) : null;
+    const needsPropertySelection = req.systemUser.role === "system_admin" && req.organization?.onboardingMode === "flexible" && !(req.organization.selectedPropertyTypes || []).length && isSubscriptionUsable(req.organization, subscription);
     const needsUnitSetup =
       req.systemUser.role === "system_admin" &&
       isSubscriptionUsable(req.organization, subscription) &&
       needsUnitSetupFor(subscription, req.organization);
     const canUseSystem =
       req.systemUser.role === "superadmin" ||
-      (req.systemUser.status === "active" &&
+      ((req.systemUser.status === "active" &&
         isSubscriptionUsable(req.organization, subscription) &&
-        !needsUnitSetup);
+        !needsUnitSetup) || subscriptionAccess.readOnly);
     const referralCode =
       req.systemUser.role === "system_admin" &&
       req.organizationId &&
@@ -1247,13 +1311,17 @@ router.get("/app/bootstrap", requireSystemAuth, async (req, res) => {
       user: publicUser(req.systemUser),
       organization: req.organization || null,
       subscription,
+      unitUsage,
       referralCode,
       latestTransaction,
       plans,
       access: {
         role: req.systemUser.role,
         canUseSystem,
+        readOnly: subscriptionAccess.readOnly,
+        readOnlyUntil: subscriptionAccess.readOnlyUntil,
         needsUnitSetup,
+        needsPropertySelection,
         needsPayment:
           req.systemUser.role !== "superadmin" &&
           (organizationStatus === "pending_payment" ||
@@ -1332,6 +1400,43 @@ router.post(
     }
   }
 );
+
+router.put("/onboarding/property-types", requireSystemAuth, requireRole("system_admin"), requireActiveOrganization, async (req, res) => {
+  try {
+    if (req.organization.onboardingMode !== "flexible") return res.status(400).json({ message: "Property types are managed by your existing unit allocation." });
+    const types = req.body?.types;
+    if (!Array.isArray(types) || !types.length || types.some((type) => !["bed", "room", "shop"].includes(type))) return res.status(400).json({ message: "Select at least one valid property type." });
+    const usage = await getUnitUsage(req.organizationId);
+    const allocation = req.organization.unitAllocation || {};
+    const required = [["bed", "beds"], ["room", "rooms"], ["shop", "shops"]].filter(([, key]) => usage[key] > 0 || Number(allocation[key] || 0) > 0).map(([type]) => type);
+    if (required.some((type) => !types.includes(type))) return res.status(400).json({ message: "Property types with existing units or allocated capacity must remain selected." });
+    req.organization.selectedPropertyTypes = [...new Set(types)];
+    req.organization.businessType = types.length === 1 ? ({ bed: "hostel", room: "rooms", shop: "shops" }[types[0]]) : "mixed";
+    await req.organization.save();
+    res.json({ organization: req.organization });
+  } catch (err) { res.status(500).json({ message: "Unable to save property types." }); }
+});
+
+router.put("/onboarding/unit-counts", requireSystemAuth, requireRole("system_admin"), async (req, res) => {
+  try {
+    if (req.organization.onboardingMode !== "flexible") return res.status(400).json({ message: "This account uses the existing unit allocation." });
+    const subscription = await Subscription.findOne({ organizationId: req.organizationId }).sort({ createdAt: -1 });
+    if (!subscription || subscription.planId || Number(subscription.amount || 0) !== 0 || !["active", "expired"].includes(subscription.status)) return res.status(400).json({ message: "Use the subscription upgrade option to change your paid plan." });
+    const raw = req.body?.units || {};
+    if (["beds", "rooms", "shops"].some((key) => !Number.isInteger(Number(raw[key] ?? 0)) || Number(raw[key] ?? 0) < 0)) return res.status(400).json({ message: "Unit counts must be non-negative whole numbers." });
+    const units = normalizeUnits(raw);
+    const usage = await getUnitUsage(req.organizationId);
+    if (!hasAnyUnit(units) || !allocationCoversUsage(units, usage)) return res.status(400).json({ message: "Counts must include all existing units and at least one unit." });
+    const types = req.organization.selectedPropertyTypes || [];
+    if ((units.beds && !types.includes("bed")) || (units.rooms && !types.includes("room")) || (units.shops && !types.includes("shop"))) return res.status(400).json({ message: "Select the property types before setting their unit counts." });
+    subscription.units = units;
+    await subscription.save();
+    req.organization.unitAllocation = units;
+    req.organization.unitCountsConfigured = true;
+    await req.organization.save();
+    res.json({ organization: req.organization, subscription, usage });
+  } catch (err) { res.status(500).json({ message: "Unable to save unit counts." }); }
+});
 
 router.get(
   "/wallet",
@@ -1455,18 +1560,65 @@ router.post("/subscription/renew-request", requireSystemAuth, async (req, res) =
       return res.status(404).json({ message: "Subscription not found" });
     }
 
+    const requestedReferralCode = normalizeReferralCode(req.body?.referralCode);
+    const firstPaidPurchase = !currentSubscription.planId &&
+      Number(currentSubscription.amount || 0) === 0 &&
+      ["active", "expired"].includes(currentSubscription.status);
+    if (requestedReferralCode && !firstPaidPurchase && currentSubscription.status !== "pending_payment") {
+      return res.status(400).json({ message: "Referral codes are available on the first paid plan purchase only." });
+    }
+
     const pendingExisting = await Subscription.findOne({
       organizationId: req.organizationId,
       status: "pending_payment",
-      createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
     }).sort({ createdAt: -1 });
 
     if (pendingExisting) {
+      if (req.body?.repricePending === true) {
+        const referralAllowed = await isFirstPaidPendingCheckout(pendingExisting);
+        if (requestedReferralCode && !referralAllowed) {
+          return res.status(400).json({ message: "Referral codes are available on the first paid plan purchase only." });
+        }
+        const referral = requestedReferralCode
+          ? await getUsableReferralCode(requestedReferralCode, { excludeOwnerOrganizationId: req.organizationId })
+          : null;
+        const transactions = await ensurePendingPaymentCanBeRepriced(pendingExisting);
+        const planPricing = calculatePendingSubscriptionPricing(pendingExisting, referral);
+        const walletPricing = await applyWalletPricing(req.organizationId, planPricing.payableAmount, req.body?.useWallet === true);
+        const pricing = { ...planPricing, ...walletPricing };
+        const transaction = await BillingTransaction.create({
+          organizationId: req.organizationId,
+          subscriptionId: pendingExisting._id,
+          merchantTransactionId: `RENREQ${Date.now()}${crypto.randomInt(1000, 9999)}`,
+          provider: "phonepe",
+          amount: pricing.payableAmount,
+          pricing,
+          currency: pendingExisting.currency || "INR",
+          status: "created",
+          requestPayload: {
+            action: "renewal_request",
+            requestedBy: String(req.systemUser._id),
+            retryForSubscriptionId: String(pendingExisting._id),
+            useWallet: req.body?.useWallet === true,
+          },
+        });
+        pendingExisting.pricing = pricing;
+        pendingExisting.amount = pricing.payableAmount;
+        pendingExisting.latestTransactionId = transaction._id;
+        await pendingExisting.save();
+        await BillingTransaction.updateMany({
+          _id: { $in: transactions.filter((item) => ["created", "pending"].includes(item.status)).map((item) => item._id) },
+        }, { $set: { status: "cancelled" } });
+        return res.json({ subscription: pendingExisting, transaction });
+      }
       const transaction = await BillingTransaction.findOne({
         subscriptionId: pendingExisting._id,
         status: { $in: ["created", "pending"] },
       }).sort({ createdAt: -1 });
       if (transaction) {
+        if (requestedReferralCode && requestedReferralCode !== String(transaction.pricing?.referralCode || "")) {
+          return res.status(409).json({ message: "Review the referral code before creating a new payment attempt." });
+        }
         return res.json({ subscription: pendingExisting, transaction });
       }
 
@@ -1493,6 +1645,9 @@ router.post("/subscription/renew-request", requireSystemAuth, async (req, res) =
       await pendingExisting.save();
       return res.json({ subscription: pendingExisting, transaction: retryTransaction });
     }
+    if (requestedReferralCode && !firstPaidPurchase) {
+      return res.status(400).json({ message: "Referral codes are available on the first paid plan purchase only." });
+    }
 
     let plan = null;
     if (req.body?.planId) {
@@ -1501,10 +1656,20 @@ router.post("/subscription/renew-request", requireSystemAuth, async (req, res) =
     } else if (currentSubscription.planId?._id) {
       plan = await SubscriptionPlan.findOne({ _id: currentSubscription.planId._id, isActive: true });
     }
+    if (requestedReferralCode && !plan) {
+      return res.status(400).json({ message: "Select a plan before applying a referral code." });
+    }
 
     const durationMonths = plan?.durationMonths || getDurationMonths(req.body) || currentSubscription.durationMonths || 12;
-    const units = normalizeUnits(currentSubscription.units || req.organization.unitAllocation || {});
-    const originalAmount = plan ? calculateSubscriptionAmount(plan, units) : Number(currentSubscription.amount || 0);
+    const units = req.organization.onboardingMode === "flexible" && !req.organization.unitCountsConfigured && !currentSubscription.planId && Number(currentSubscription.amount || 0) === 0
+      ? normalizeUnits(await getUnitUsage(req.organizationId))
+      : normalizeUnits(currentSubscription.units || req.organization.unitAllocation || {});
+    if (!hasAnyUnit(units)) return res.status(400).json({ message: "Add at least one unit before purchasing a plan." });
+    const referral = requestedReferralCode
+      ? await getUsableReferralCode(requestedReferralCode, { excludeOwnerOrganizationId: req.organizationId })
+      : null;
+    const planPricing = plan ? calculateSubscriptionPricing(plan, units, referral) : null;
+    const originalAmount = planPricing ? planPricing.payableAmount : Number(currentSubscription.amount || 0);
     const walletPricing = await applyWalletPricing(req.organizationId, originalAmount, req.body?.useWallet === true);
     const amount = walletPricing.payableAmount;
     const currency = plan?.currency || currentSubscription.currency || "INR";
@@ -1521,8 +1686,7 @@ router.post("/subscription/renew-request", requireSystemAuth, async (req, res) =
       units,
       amount,
       pricing: {
-        subtotal: originalAmount,
-        payableAmount: amount,
+        ...(planPricing || { subtotal: originalAmount }),
         ...walletPricing,
       },
       currency,
@@ -1535,8 +1699,7 @@ router.post("/subscription/renew-request", requireSystemAuth, async (req, res) =
       provider: "phonepe",
       amount,
       pricing: {
-        subtotal: originalAmount,
-        payableAmount: amount,
+        ...(planPricing || { subtotal: originalAmount }),
         ...walletPricing,
       },
       currency,
@@ -1593,6 +1756,7 @@ router.post("/subscription/renew-request", requireSystemAuth, async (req, res) =
 
     res.status(201).json({ subscription, transaction });
   } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ message: err.message });
     console.error("renew request error:", err);
     res.status(500).json({ message: "Server error" });
   }
@@ -1624,6 +1788,7 @@ router.post(
       // unfinished checkout must never turn a later trial unit addition into a
       // paid upgrade.
       if (isTrialSubscription(currentSubscription)) {
+        if (req.organization.onboardingMode === "flexible" && !req.organization.unitCountsConfigured) return res.status(400).json({ message: "Set your unit counts before adding trial capacity." });
         const trialAddedUnits = normalizeUnits(req.body?.units || req.body?.addUnits || {});
         if (!hasAnyUnit(trialAddedUnits)) {
           return res.status(400).json({ message: "Add at least one bed, room, or shop" });
@@ -1642,7 +1807,7 @@ router.post(
         await currentSubscription.save();
         req.organization.unitAllocation = trialNewUnits;
         await req.organization.save();
-        await ensureReservedUnits(req.organizationId, trialNewUnits);
+        if (req.organization.onboardingMode !== "flexible") await ensureReservedUnits(req.organizationId, trialNewUnits);
         return res.json({
           message: "Trial units added. Payment will be calculated when the trial ends.",
           subscription: currentSubscription,
@@ -1812,6 +1977,7 @@ router.post("/register", registrationIpLimit, async (req, res) => {
       phone: req.body?.phone || "",
       address: req.body?.address || "",
       unitAllocation: units,
+      onboardingMode: "flexible",
       features: {
         canteenEnabled: false,
       },
@@ -1869,7 +2035,7 @@ router.post("/register", registrationIpLimit, async (req, res) => {
       notifyOrganization(organization._id, {
         type: "registration",
         title: "Trial account created",
-        message: `Welcome ${ownerName}. Your 15-day trial is active. Login and set your property unit counts to start using the system.`,
+        message: `Welcome ${ownerName}. Your 15-day trial is active. Log in and select your property types to get started.`,
         priority: "normal",
         entityType: "subscription",
         entityId: subscription._id,
@@ -1899,9 +2065,26 @@ router.post("/register", registrationIpLimit, async (req, res) => {
   }
 });
 
-router.post("/referrals/quote", async (req, res) => {
+router.post("/referrals/quote", requireSystemAuth, async (req, res) => {
   try {
-    const referral = await getUsableReferralCode(req.body?.referralCode);
+    if (!req.organizationId || !req.organization) {
+      return res.status(403).json({ message: "Organization required" });
+    }
+    if (!normalizeReferralCode(req.body?.referralCode)) {
+      return res.status(400).json({ message: "Enter a referral code." });
+    }
+    const currentSubscription = await Subscription.findOne({ organizationId: req.organizationId }).sort({ createdAt: -1 });
+    const firstPaidPending = await isFirstPaidPendingCheckout(currentSubscription);
+    const firstPaidTrial = currentSubscription && !currentSubscription.planId &&
+      Number(currentSubscription.amount || 0) === 0 && ["active", "expired"].includes(currentSubscription.status);
+    if (!firstPaidTrial && !firstPaidPending) {
+      return res.status(400).json({ message: "Referral codes are available on the first paid plan purchase only." });
+    }
+    const referral = await getUsableReferralCode(req.body?.referralCode, { excludeOwnerOrganizationId: req.organizationId });
+    if (firstPaidPending) {
+      const pricing = calculatePendingSubscriptionPricing(currentSubscription, referral);
+      return res.json({ referral: publicReferralCode(referral), pricing, units: normalizeUnits(currentSubscription.units) });
+    }
     let plan = null;
     if (req.body?.planId) {
       plan = await SubscriptionPlan.findOne({ _id: req.body.planId, isActive: true });
@@ -1912,9 +2095,11 @@ router.post("/referrals/quote", async (req, res) => {
     }
     if (!plan) return res.status(404).json({ message: "Active subscription plan not found" });
 
-    const units = normalizeUnits(req.body?.units || req.body);
+    const units = req.organization.onboardingMode === "flexible" && !req.organization.unitCountsConfigured
+      ? normalizeUnits(await getUnitUsage(req.organizationId))
+      : normalizeUnits(currentSubscription.units || req.organization.unitAllocation || {});
     const pricing = calculateSubscriptionPricing(plan, units, referral);
-    res.json({ referral: publicReferralCode(referral), pricing });
+    res.json({ referral: publicReferralCode(referral), pricing, units });
   } catch (err) {
     res.status(err.statusCode || 400).json({ message: err.message || "Invalid referral code" });
   }
@@ -2235,8 +2420,8 @@ router.delete(
       }
       await AuditLog.create({ organizationId: organization._id, entityType: "unit", entityId: room._id, action: "delete", actorId: String(req.systemUser._id), actorName: req.systemUser.name || "Superadmin", actorEmail: req.systemUser.email || "", actorRole: "superadmin", reason, before: { propertyType: room.propertyType, roomNo: room.roomNo, bedNo: bedNo || null }, after: { units: newUnits }, changes: { removed, decrement } });
       const affectedCount = removed?.affectedTenants?.length || 0;
-      await notifyOrganization(organization._id, { type: "system", title: "Unit count updated", message: affectedCount ? `A unit with ${affectedCount} active tenant(s) was retired by support. Their records remain available as history from ${effectiveDate}.` : "A vacant unit was removed by support. Your subscription amount will reflect the updated unit count.", priority: "normal", entityType: "organization", entityId: organization._id, actionType: "unit_reduction", payload: { removed, units: newUnits, reason, effectiveDate } });
-      res.json({ message: affectedCount ? "Unit retired. Tenant history was retained and the subscription count was updated." : "Vacant unit removed and subscription count updated", units: newUnits, removed, effectiveDate });
+      await notifyOrganization(organization._id, { type: "system", title: "Unit count updated", message: affectedCount ? `An occupied unit was removed by support. Its tenants were moved to former records today; their history remains available from ${effectiveDate}.` : "A vacant unit was removed by support. Your subscription amount will reflect the updated unit count.", priority: "normal", entityType: "organization", entityId: organization._id, actionType: "unit_reduction", payload: { removed, units: newUnits, reason, effectiveDate } });
+      res.json({ message: affectedCount ? "Occupied unit removed. Tenant history was kept and the subscription count was updated." : "Vacant unit removed and subscription count updated", units: newUnits, removed, effectiveDate });
     } catch (err) {
       res.status(500).json({ message: "Unable to remove unit", error: err.message });
     }

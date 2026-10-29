@@ -1,10 +1,12 @@
 // routes/formRoutes.js
 const express = require("express");
+const mongoose = require("mongoose");
 const router = express.Router();
 const XLSX = require("xlsx");
 
 // Models (used by a couple of inline routes)
 const Form = require("../models/formModels");
+const Archive = require("../models/archiveSchema");
 const Organization = require("../models/Organization");
 const Room = require("../models/Room");
 const authAdmin = require("../middleware/adminAuth");
@@ -28,6 +30,7 @@ const { getCanteenQuoteForMonth } = require("./_helpers/canteenBilling");
 const { getLightBillQuoteForMonth } = require("./_helpers/lightBillBilling");
 const { sendRentReminderSmsJob } = require("../services/rentReminderSmsService");
 const { deriveFirstRentMonth } = require("./_helpers/firstRentCycle");
+const { syncUnitStay } = require("../services/unitHistory");
 
 const hasLegacyQuickTenantRentHistory = (tenant = {}) => {
   const history = Array.isArray(tenant.rentHistory) ? tenant.rentHistory : [];
@@ -94,6 +97,7 @@ const {
   getArchivedForms,
   saveLeaveDate,
   restoreForm,
+  sanitizeRestoredFormData,
   archiveForm,
   getDuplicateForms,
   deleteForm,
@@ -165,7 +169,7 @@ router.post("/forms/quick-add", async (req, res) => {
     const firstRentMonthDate = new Date(joiningParts[0], joiningParts[1] - 1 + (firstRentStatus === "NOT_PAID" ? 1 : 0), 1);
     const firstRentMonth = `${firstRentMonthDate.toLocaleString("en-US", { month: "short" })}-${String(firstRentMonthDate.getFullYear()).slice(-2)}`;
 
-    const srNo = await assignNextSrNoAndUpdateCounter();
+    const srNo = await assignNextSrNoAndUpdateCounter(req.organizationId);
     const tenant = await Form.create(scopedCreate(req, {
       srNo,
       name,
@@ -192,6 +196,7 @@ router.post("/forms/quick-add", async (req, res) => {
         ? [{ rentAmount, date: joiningDate, month: firstRentMonth, paymentMode: "Cash" }]
         : [],
       intakeStatus: "pending_tenant",
+      pendingAssignmentOrigin: "quick_add",
       firstRentStatus,
       firstRentMonth,
       hasCanteen: false,
@@ -387,7 +392,7 @@ router.post("/forms/import", async (req, res) => {
         }] : [],
       });
 
-      const nextSrNo = await assignNextSrNoAndUpdateCounter();
+      const nextSrNo = await assignNextSrNoAndUpdateCounter(req.organizationId);
       payload.srNo = Number(nextSrNo);
 
       const doc = await Form.create(payload);
@@ -1006,11 +1011,6 @@ function isActiveTenant(tenant) {
   return leaveDate > today;
 }
 
-function isSameCategory(tenant, category) {
-  const tenantCategory = String(tenant?.category || "").trim();
-  return !tenantCategory || !category || tenantCategory === category;
-}
-
 function normalizePropertyType(value) {
   const raw = String(value || "").trim().toLowerCase();
   if (raw === "room" || raw === "shop") return raw;
@@ -1225,6 +1225,15 @@ function tenantPropertyType(tenant = {}) {
   return "bed";
 }
 
+function tenantOccupiesRoom(tenant = {}, room = {}) {
+  if (tenant.roomId && String(tenant.roomId) === String(room._id)) return true;
+  if (tenantPropertyType(tenant) !== normalizePropertyType(room.propertyType)) return false;
+  if (!tenant.roomNo || normalizeImportToken(tenant.roomNo) !== normalizeImportToken(room.roomNo)) return false;
+  return (!tenant.category || !room.category || normalizeImportToken(tenant.category) === normalizeImportToken(room.category)) &&
+    (!tenant.wingName || normalizeImportToken(tenant.wingName) === normalizeImportToken(room.wingName)) &&
+    (!tenant.floorNo || !room.floorNo || normalizeImportToken(tenant.floorNo) === normalizeImportToken(room.floorNo));
+}
+
 function propertyTypeLabel(value) {
   const type = normalizePropertyType(value);
   if (type === "room") return "Residential room";
@@ -1232,62 +1241,91 @@ function propertyTypeLabel(value) {
   return "Hostel bed";
 }
 
-async function getVacantBeds(req, excludeTenantId) {
+function unitNeedsDetails(room = {}) {
+  const roomNo = String(room.roomNo || "").trim();
+  const primaryBedMissing = normalizePropertyType(room.propertyType) !== "bed" &&
+    !String(room.beds?.[0]?.bedNo || "").trim();
+  return Boolean(room.isPlaceholder) || /^UNASSIGNED-/i.test(roomNo) ||
+    !roomNo || !String(room.category || "").trim() || !String(room.floorNo || "").trim() || primaryBedMissing;
+}
+
+async function getVacantBeds(req, excludeTenantId, targetType) {
   const [rooms, forms] = await Promise.all([
     Room.find(scopedQuery(req)).lean(),
-    Form.find(scopedQuery(req)).select("_id propertyType roomId roomNo bedNo category wingName floorNo leaveDate").lean(),
+    Form.find(scopedQuery(req)).select("_id propertyType roomId roomNo bedNo category wingName floorNo leaveDate intakeStatus").lean(),
   ]);
 
   const roomById = new Map(rooms.map((room) => [String(room._id), room]));
-  const roomForTenant = (tenant) =>
-    (tenant.roomId && roomById.get(String(tenant.roomId))) ||
-    rooms.find((room) =>
-      String(room.roomNo || "").trim() === String(tenant.roomNo || "").trim() &&
-      normalizePropertyType(room.propertyType) === normalizePropertyType(tenant.propertyType) &&
-      String(room.category || "").trim() === String(tenant.category || "").trim() &&
-      String(room.wingName || "").trim() === String(tenant.wingName || "").trim() &&
-      String(room.floorNo || "").trim() === String(tenant.floorNo || "").trim()
-    );
+  const roomsByNumber = new Map();
+  rooms.forEach((room) => {
+    const key = normalizeImportToken(room.roomNo);
+    if (!roomsByNumber.has(key)) roomsByNumber.set(key, []);
+    roomsByNumber.get(key).push(room);
+  });
 
   const occupiedBeds = new Set();
   const occupiedRooms = new Set();
+  const roomsWithOccupants = new Set();
   forms.forEach((tenant) => {
     if (excludeTenantId && String(tenant._id) === String(excludeTenantId)) return;
-    if (!isActiveTenant(tenant)) return;
+    if (tenant.intakeStatus === "pending_tenant" || !isActiveTenant(tenant)) return;
 
-    const room = roomForTenant(tenant);
-    const roomKey = room ? String(room._id) : "";
-    const roomNo = String(tenant.roomNo || "").trim();
-    const bedNo = String(tenant.bedNo || "").trim();
-    const propertyType = normalizePropertyType(tenant.propertyType || room?.propertyType);
+    const possibleRooms = new Map();
+    const roomByIdMatch = tenant.roomId && roomById.get(String(tenant.roomId));
+    if (roomByIdMatch) possibleRooms.set(String(roomByIdMatch._id), roomByIdMatch);
+    (roomsByNumber.get(normalizeImportToken(tenant.roomNo)) || []).forEach((room) => {
+      if (tenantOccupiesRoom(tenant, room)) possibleRooms.set(String(room._id), room);
+    });
 
-    if (!roomNo || !roomKey) return;
-
-    if (propertyType === "bed") {
-      if (bedNo) occupiedBeds.add(`${roomKey}__${bedNo}`);
-      return;
-    }
-
-    occupiedRooms.add(roomKey);
+    possibleRooms.forEach((room) => {
+      const roomKey = String(room._id);
+      roomsWithOccupants.add(roomKey);
+      const propertyType = normalizePropertyType(room.propertyType);
+      if (propertyType === "bed") {
+        const bedNo = normalizeImportToken(tenant.bedNo);
+        if (bedNo) occupiedBeds.add(`${roomKey}__${bedNo}`);
+      } else {
+        occupiedRooms.add(roomKey);
+      }
+    });
   });
 
   const vacantBeds = [];
+  let pendingDetailsCount = 0;
   rooms.forEach((room) => {
     const roomNo = String(room.roomNo || "").trim();
     const propertyType = normalizePropertyType(room.propertyType);
     const roomBeds = Array.isArray(room.beds) ? room.beds : [];
 
-    if (!roomNo || !roomBeds.length) return;
+    if (unitNeedsDetails(room)) {
+      if (propertyType !== targetType) return;
+      if (propertyType === "bed") {
+        const roomKey = String(room._id);
+        const unassignedBeds = roomBeds.filter((bed) => {
+          const bedNo = normalizeImportToken(bed?.bedNo);
+          return bedNo ? !occupiedBeds.has(`${roomKey}__${bedNo}`) : !roomsWithOccupants.has(roomKey);
+        }).length;
+        pendingDetailsCount += unassignedBeds || (room.isPlaceholder && !roomBeds.length && !roomsWithOccupants.has(roomKey) ? 1 : 0);
+      } else if (!occupiedRooms.has(String(room._id))) {
+        pendingDetailsCount += 1;
+      }
+      return;
+    }
+    if (!roomBeds.length) return;
 
     if (propertyType !== "bed") {
       if (occupiedRooms.has(String(room._id))) return;
 
       const primaryBed = roomBeds[0];
       const bedNo = String(primaryBed?.bedNo || "").trim();
-      if (!bedNo) return;
+      if (!bedNo) {
+        if (propertyType === targetType && !roomsWithOccupants.has(String(room._id))) pendingDetailsCount += 1;
+        return;
+      }
 
       vacantBeds.push({
         roomId: String(room._id),
+        propertyType,
         category: room.category || "",
         wingName: room.wingName || "",
         floorNo: room.floorNo || "",
@@ -1301,9 +1339,14 @@ async function getVacantBeds(req, excludeTenantId) {
 
     roomBeds.forEach((bed) => {
       const bedNo = String(bed.bedNo || "").trim();
-      if (!bedNo || occupiedBeds.has(`${String(room._id)}__${bedNo}`)) return;
+      if (!bedNo) {
+        if (propertyType === targetType && !roomsWithOccupants.has(String(room._id))) pendingDetailsCount += 1;
+        return;
+      }
+      if (occupiedBeds.has(`${String(room._id)}__${normalizeImportToken(bedNo)}`)) return;
       vacantBeds.push({
         roomId: String(room._id),
+        propertyType,
         category: room.category || "",
         wingName: room.wingName || "",
         floorNo: room.floorNo || "",
@@ -1315,11 +1358,12 @@ async function getVacantBeds(req, excludeTenantId) {
     });
   });
 
-  return vacantBeds.sort((a, b) => {
+  vacantBeds.sort((a, b) => {
     const roomCmp = String(a.roomNo).localeCompare(String(b.roomNo), undefined, { numeric: true });
     if (roomCmp !== 0) return roomCmp;
     return String(a.bedNo).localeCompare(String(b.bedNo), undefined, { numeric: true });
   });
+  return { vacantBeds, pendingDetailsCount };
 }
 
 // cancel leave inline route
@@ -1334,70 +1378,96 @@ router.post("/cancel-leave", async (req, res) => {
     floorNo: requestedFloorNo,
   } = req.body || {};
   try {
-    const tenant = await Form.findOne(scopedQuery(req, { _id: id }));
+    const activeTenant = await Form.findOne(scopedQuery(req, { _id: id }));
+    const archivedTenant = activeTenant
+      ? null
+      : await Archive.findOne(scopedQuery(req, { $or: [{ _id: id }, { originalFormId: id }] }));
+    const tenant = activeTenant || archivedTenant;
     if (!tenant) {
-      return res.status(404).json({ success: false, message: "Form not found" });
+      return res.status(404).json({ success: false, message: "Leaved tenant record not found" });
     }
+    const tenantData = typeof tenant.toObject === "function" ? tenant.toObject() : { ...tenant };
 
-    const roomNo = String(requestedRoomNo || tenant.roomNo || "").trim();
-    const category = String(requestedCategory || tenant.category || "").trim();
-    const wingName = String(requestedWingName || tenant.wingName || "").trim();
-    const floorNo = String(requestedFloorNo || tenant.floorNo || "").trim();
-    const roomId = String(requestedRoomId || tenant.roomId || "").trim();
-    const room = roomId
+    let roomNo = String(requestedRoomNo || tenantData.roomNo || "").trim();
+    let category = String(requestedCategory || tenantData.category || "").trim();
+    let wingName = String(requestedWingName || tenantData.wingName || "").trim();
+    let floorNo = String(requestedFloorNo || tenantData.floorNo || "").trim();
+    const roomId = String(requestedRoomId || tenantData.roomId || "").trim();
+    let room = roomId && mongoose.isValidObjectId(roomId)
       ? await Room.findOne(scopedQuery(req, { _id: roomId })).lean()
-      : roomNo
-      ? await Room.findOne(scopedQuery(req, {
+      : null;
+    if (!room && roomNo) {
+      room = await Room.findOne(scopedQuery(req, {
           roomNo,
           category,
           wingName,
           floorNo,
-          propertyType: normalizePropertyType(tenant.propertyType),
-        })).lean()
-      : null;
-    const propertyType = normalizePropertyType(room?.propertyType || tenant.propertyType);
+          propertyType: tenantPropertyType(tenantData),
+        })).lean();
+    }
+    const previousNeedsDetails = Boolean(room && unitNeedsDetails(room));
+    if (previousNeedsDetails) room = null;
+    if (room) {
+      roomNo = String(room.roomNo || "").trim();
+      category = String(room.category || "").trim();
+      wingName = String(room.wingName || "").trim();
+      floorNo = String(room.floorNo || "").trim();
+    }
+    const propertyType = room ? normalizePropertyType(room.propertyType) : tenantPropertyType(tenantData);
+    if (room && propertyType !== tenantPropertyType(tenantData)) {
+      return res.status(400).json({ success: false, message: "Choose a vacant unit from the tenant's original section." });
+    }
     const fallbackBedNo = String(room?.beds?.[0]?.bedNo || "").trim();
-    const bedNo = String(requestedBedNo || tenant.bedNo || fallbackBedNo || "").trim();
-    if (!roomNo || (propertyType === "bed" && !bedNo)) {
-      const vacantBeds = await getVacantBeds(req, id);
+    const bedNo = String(
+      propertyType === "bed"
+        ? (requestedBedNo || tenantData.bedNo || "")
+        : (fallbackBedNo || requestedBedNo || tenantData.bedNo || "")
+    ).trim();
+    const bedExists = propertyType !== "bed" || (room?.beds || []).some(
+      (bed) => normalizeImportToken(bed?.bedNo) === normalizeImportToken(bedNo)
+    );
+    if (!room || !roomNo || (propertyType === "bed" && (!bedNo || !bedExists))) {
+      const { vacantBeds, pendingDetailsCount } = await getVacantBeds(req, id, propertyType);
       return res.status(409).json({
         success: false,
         code: "BED_REQUIRED",
         message:
-          propertyType === "shop"
+          previousNeedsDetails
+            ? `The ${requestedRoomId ? "selected" : "previous"} unit needs its details set before it can be assigned.`
+            : !room
+            ? `Previous ${propertyType === "shop" ? "shop" : propertyType === "room" ? "room" : "room or bed"} is no longer available. Select another vacant unit.`
+            : propertyType === "bed" && bedNo && !bedExists
+            ? `Previous bed Room ${roomNo}, Bed ${bedNo} is no longer available. Select another vacant bed.`
+            : propertyType === "shop"
             ? "Please select a shop before undoing leave."
             : propertyType === "room"
             ? "Please select a room before undoing leave."
             : "Please select a room and bed before undoing leave.",
         vacantBeds,
+        pendingDetailsCount,
       });
     }
 
     const candidates = await Form.find(scopedQuery(req, {
-      propertyType,
-      _id: { $ne: id },
+      _id: { $ne: tenantData.originalFormId || id },
     }))
-      .select("_id name propertyType roomId roomNo bedNo category wingName floorNo leaveDate")
+      .select("_id name propertyType roomId roomNo bedNo category wingName floorNo leaveDate intakeStatus")
       .lean();
     const activeConflict = candidates.find((candidate) => {
-      if (!isActiveTenant(candidate)) return false;
-      const sameRoom =
-        (room?._id && candidate.roomId && String(candidate.roomId) === String(room._id)) ||
-        (String(candidate.roomNo || "").trim() === roomNo &&
-          isSameCategory(candidate, category) &&
-          String(candidate.wingName || "").trim() === wingName &&
-          String(candidate.floorNo || "").trim() === floorNo);
-      return sameRoom && (propertyType !== "bed" || String(candidate.bedNo || "").trim() === bedNo);
+      if (candidate.intakeStatus === "pending_tenant" || !isActiveTenant(candidate)) return false;
+      if (!tenantOccupiesRoom(candidate, room)) return false;
+      return propertyType !== "bed" || normalizeImportToken(candidate.bedNo) === normalizeImportToken(bedNo);
     });
 
     if (activeConflict) {
-      const vacantBeds = await getVacantBeds(req, id);
+      const { vacantBeds, pendingDetailsCount } = await getVacantBeds(req, id, propertyType);
+      const unitReference = requestedRoomId ? "Selected" : "Previous";
       const conflictLabel =
         propertyType === "shop"
-          ? `Old shop ${roomNo} is already occupied by ${activeConflict.name || "another tenant"}. Select another vacant shop to undo leave.`
+          ? `${unitReference} shop ${roomNo} is already occupied by ${activeConflict.name || "another tenant"}.`
           : propertyType === "room"
-          ? `Old room ${roomNo} is already occupied by ${activeConflict.name || "another tenant"}. Select another vacant room to undo leave.`
-          : `Old bed Room ${roomNo}, Bed ${bedNo} is already occupied by ${activeConflict.name || "another tenant"}. Select another vacant bed to undo leave.`;
+          ? `${unitReference} room ${roomNo} is already occupied by ${activeConflict.name || "another tenant"}.`
+          : `${unitReference} bed Room ${roomNo}, Bed ${bedNo} is already occupied by ${activeConflict.name || "another tenant"}.`;
       return res.status(409).json({
         success: false,
         code: "BED_OCCUPIED",
@@ -1409,32 +1479,70 @@ router.post("/cancel-leave", async (req, res) => {
           bedNo: activeConflict.bedNo || "",
         },
         vacantBeds,
+        pendingDetailsCount,
       });
     }
 
-    const updated = await Form.findOneAndUpdate(
-      scopedQuery(req, { _id: id }),
-      {
-        $set: {
-          roomNo,
-          bedNo,
-          ...(room?._id ? { roomId: String(room._id) } : {}),
-          ...(category ? { category } : {}),
-          ...(wingName ? { wingName } : {}),
-          ...(floorNo ? { floorNo } : {}),
+    const locationUpdate = {
+      propertyType,
+      roomNo,
+      bedNo,
+      roomId: String(room._id),
+      category: room.category || category,
+      wingName: room.wingName || wingName,
+      hasWing: Boolean(room.wingName),
+      floorNo: room.floorNo || floorNo,
+    };
+    let updated;
+    if (archivedTenant) {
+      const restoredData = {
+        ...tenantData,
+        ...locationUpdate,
+      };
+      // Keep the tenant's original ID so existing payment and document links remain valid.
+      restoredData._id = tenantData.originalFormId || tenantData._id;
+      if (String(restoredData._id) !== String(id)) {
+        const existingOriginal = await Form.findOne(scopedQuery(req, { _id: restoredData._id })).lean();
+        if (existingOriginal) {
+          return res.status(409).json({ success: false, code: "TENANT_ALREADY_ACTIVE", message: "This tenant is already active. Refresh the tenant list." });
+        }
+      }
+      delete restoredData.__v;
+      delete restoredData.originalFormId;
+      delete restoredData.leaveDate;
+      delete restoredData.isOnLeave;
+      delete restoredData.leaveSettlement;
+      sanitizeRestoredFormData(restoredData);
+      try {
+        await syncUnitStay({ ...tenantData, _id: tenantData.originalFormId || tenantData._id }, null);
+      } catch (historyError) {
+        console.error("Unable to record previous unit stay:", historyError.message);
+      }
+      updated = new Form(scopedCreate(req, restoredData));
+      await updated.save();
+      await Archive.deleteOne(scopedQuery(req, { _id: archivedTenant._id }));
+    } else {
+      updated = await Form.findOneAndUpdate(
+        scopedQuery(req, { _id: id }),
+        {
+          $set: locationUpdate,
+          $unset: {
+            leaveDate: "",
+            isOnLeave: "",
+            leaveSettlement: "",
+          },
         },
-        $unset: {
-          leaveDate: "",
-          isOnLeave: "",
-          leaveSettlement: "",
-        },
-      },
-      { new: true }
-    );
+        { new: true }
+      );
+    }
 
     res.json({ success: true, form: updated });
   } catch (error) {
-    res.status(500).json({ success: false, error: "Error cancelling leave" });
+    console.error("Error cancelling leave:", error);
+    res.status(500).json({
+      success: false,
+      message: error?.name === "ValidationError" ? error.message : "Could not undo leave. Please try again.",
+    });
   }
 });
 

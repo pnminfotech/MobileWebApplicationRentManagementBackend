@@ -6,7 +6,7 @@ const DuplicateForm = require("../models/DuplicateForm");
 const Invite = require("../models/Invite");
 const Room = require("../models/Room");
 const cron = require("node-cron");
-const Counter = require("../models/counterModel");
+const { assignTenantSerial, previewTenantSerial } = require("../services/tenantSerial");
 const { normalizeFirstRentCycle, deriveFirstRentMonth } = require("../routes/_helpers/firstRentCycle");
 const {
   appendRentHistorySnapshot,
@@ -31,6 +31,7 @@ const {
 } = require("../utils/organizationScope");
 const { writeAuditLog } = require("../utils/auditLogger");
 const { resolveNotifications } = require("../services/notificationService");
+const { syncUnitStay } = require("../services/unitHistory");
 const { sendAdmissionSms, sendPaymentReceivedSms } = require("../services/smsService");
 const Organization = require("../models/Organization");
 const SystemUser = require("../models/SystemUser");
@@ -79,7 +80,6 @@ async function validateTenantSlotAvailable(req, data = {}, excludeId = null) {
   if (!slot.roomNo || (slot.propertyType === "bed" && !slot.bedNo)) return null;
 
   const query = scopedQuery(req, {
-    propertyType: slot.propertyType,
     intakeStatus: { $ne: "pending_tenant" },
   });
   if (excludeId) query._id = { $ne: excludeId };
@@ -93,10 +93,11 @@ async function validateTenantSlotAvailable(req, data = {}, excludeId = null) {
     const existingSlot = tenantSlotFromData(tenant);
     const isSameUnit =
       (slot.roomId && existingSlot.roomId && existingSlot.roomId === slot.roomId) ||
-      (existingSlot.category === slot.category &&
-        existingSlot.wingName === slot.wingName &&
-        existingSlot.floorNo === slot.floorNo &&
-        existingSlot.roomNo === slot.roomNo);
+      (existingSlot.propertyType === slot.propertyType &&
+        existingSlot.roomNo === slot.roomNo &&
+        (!existingSlot.category || existingSlot.category === slot.category) &&
+        (!existingSlot.wingName || existingSlot.wingName === slot.wingName) &&
+        (!existingSlot.floorNo || existingSlot.floorNo === slot.floorNo));
     if (!isSameUnit) return false;
     return slot.propertyType !== "bed" || existingSlot.bedNo === slot.bedNo;
   });
@@ -195,6 +196,11 @@ function normalizeRestoreRent(rent, fallbackDate) {
           if (!Number.isFinite(amount) || amount <= 0) return null;
           return {
             amount,
+            rentAmount: Number(payment?.rentAmount ?? payment?.amount ?? 0) || 0,
+            discountAmount: Number(payment?.discountAmount || 0) || 0,
+            canteenAmount: Number(payment?.canteenAmount || 0) || 0,
+            lightBillAmount: Number(payment?.lightBillAmount || 0) || 0,
+            extraAmount: Number(payment?.extraAmount || 0) || 0,
             date: safePaymentDate,
             paymentMode: normalizePaymentMode(payment?.paymentMode || rent?.paymentMode),
             utr: String(payment?.utr || ""),
@@ -206,7 +212,11 @@ function normalizeRestoreRent(rent, fallbackDate) {
     : [];
 
   return {
-    rentAmount: Math.max(rentAmount, payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0)),
+    rentAmount,
+    discountAmount: Number(rent?.discountAmount || 0) || 0,
+    canteenAmount: Number(rent?.canteenAmount || 0) || 0,
+    lightBillAmount: Number(rent?.lightBillAmount || 0) || 0,
+    totalAmount: Number(rent?.totalAmount ?? (payments.length ? payments.reduce((sum, payment) => sum + payment.amount, 0) : rentAmount)) || 0,
     date: safeDate,
     month,
     paymentMode: normalizePaymentMode(rent?.paymentMode),
@@ -242,55 +252,12 @@ function sanitizeRestoredFormData(data) {
    ==========================================================================*/
 
 // Preview next SrNo for UI only – DOES NOT touch DB
-const computeNextSrNoPreview = async () => {
-  const [counter, lastForm] = await Promise.all([
-    Counter.findOne({ name: "form_srno" }),
-    Form.findOne().sort({ srNo: -1 }).lean(),
-  ]);
-
-  const maxExisting = lastForm ? Number(lastForm.srNo) || 0 : 0;
-  const currentSeq = counter ? Number(counter.seq) || 0 : 0;
-
-  const base = Math.max(maxExisting, currentSeq);
-  return base + 1;
-};
-
-// Main helper: sets Counter.seq so it is ALWAYS >= max(srNo in forms)
-// and returns the NEXT srNo to use.
-const assignNextSrNoAndUpdateCounter = async () => {
-  const [counter, lastForm] = await Promise.all([
-    Counter.findOne({ name: "form_srno" }),
-    Form.findOne().sort({ srNo: -1 }).lean(),
-  ]);
-
-  const maxExisting = lastForm ? Number(lastForm.srNo) || 0 : 0;
-  const currentSeq = counter ? Number(counter.seq) || 0 : 0;
-
-  const base = Math.max(maxExisting, currentSeq);
-  const next = base + 1;
-
-  const updatedCounter = await Counter.findOneAndUpdate(
-    { name: "form_srno" },
-    { $set: { name: "form_srno", seq: next } },
-    { new: true, upsert: true }
-  );
-
-  return updatedCounter.seq;
-};
+const assignNextSrNoAndUpdateCounter = (organizationId) => assignTenantSerial(organizationId);
 
 // API: used by frontend just to **show** next SrNo
 const getNextSrNo = async (req, res) => {
   try {
-    const [counter, lastForm] = await Promise.all([
-      Counter.findOne({ name: "form_srno" }),
-      Form.findOne(scopedQuery(req)).sort({ srNo: -1 }).lean(),
-    ]);
-
-    const maxExisting = lastForm ? Number(lastForm.srNo) || 0 : 0;
-    const currentSeq = counter ? Number(counter.seq) || 0 : 0;
-
-    const next = Math.max(maxExisting, currentSeq) + 1;
-
+    const next = await previewTenantSerial(req.organizationId);
     return res.json({ nextSrNo: next });
   } catch (err) {
     console.error("Error getting next SrNo:", err);
@@ -382,7 +349,7 @@ cron.schedule("0 0 * * *", async () => {
 
 const saveForm = async (req, res) => {
   try {
-    const nextSrNo = await assignNextSrNoAndUpdateCounter();
+    const nextSrNo = await assignNextSrNoAndUpdateCounter(req.organizationId);
     const payload = scopedCreate(req, { ...(req.body || {}), srNo: String(nextSrNo) });
     payload.hasCanteen = payload.propertyType === "bed" && req.organization?.features?.canteenEnabled
       ? Boolean(payload.hasCanteen)
@@ -974,6 +941,11 @@ const restoreForm = async (req, res) => {
       });
     }
 
+    try {
+      await syncUnitStay({ ...archivedData.toObject(), _id: archivedData.originalFormId || archivedData._id }, null);
+    } catch (historyError) {
+      console.error("Unable to record previous unit stay:", historyError.message);
+    }
     const restoredForm = new Form(scopedCreate(req, restoredData));
     await restoredForm.save();
 
@@ -1122,8 +1094,39 @@ const updateFormById = async (req, res) => {
     }
     update.propertyType = propertyTypeFromTenantData({ ...existing.toObject(), ...update });
     update.intakeStatus = normalizeIntakeStatus(update.intakeStatus || existing.intakeStatus);
+    if (existing.intakeStatus === "pending_tenant" && update.intakeStatus === "submitted") {
+      // A returning tenant must be treated as active when checking the new unit.
+      update.leaveDate = "";
+      if (!mongoose.isValidObjectId(update.roomId)) {
+        return res.status(400).json({ message: "Select a valid vacant unit." });
+      }
+      const unit = await Room.findOne(scopedQuery(req, {
+        _id: update.roomId,
+        isPlaceholder: { $ne: true },
+      })).lean();
+      if (!unit) return res.status(409).json({ message: "This unit is no longer available. Refresh and select another unit." });
+      const unitType = propertyTypeFromTenantData({ propertyType: unit.propertyType, bedNo: unit.beds?.[0]?.bedNo });
+      if (unitType !== update.propertyType) {
+        return res.status(400).json({ message: "Select a unit from the tenant's section." });
+      }
+      const beds = Array.isArray(unit.beds) ? unit.beds : [];
+      const selectedBed = unitType === "bed"
+        ? beds.find((bed) => normalizeIdentifier(bed.bedNo) === normalizeIdentifier(update.bedNo))
+        : beds[0];
+      if (!selectedBed) return res.status(409).json({ message: "This unit or bed is no longer available. Refresh and select another unit." });
+      update.roomId = String(unit._id);
+      update.category = unit.category || "";
+      update.wingName = unit.wingName || "";
+      update.hasWing = Boolean(unit.wingName);
+      update.floorNo = unit.floorNo || "";
+      update.roomNo = unit.roomNo || "";
+      update.bedNo = unitType === "bed" ? String(selectedBed.bedNo) : unitType === "shop" ? "SHOP-1" : "ROOM-1";
+    }
+    const isReturningPendingTenant = existing.intakeStatus === "pending_tenant" &&
+      existing.pendingAssignmentOrigin === "returning_tenant";
     // Pending records come from Quick tenant add and retain the rent entered there.
-    if (existing.intakeStatus === "pending_tenant") update.tenantRentOverride = true;
+    if (existing.intakeStatus === "pending_tenant" && !isReturningPendingTenant) update.tenantRentOverride = true;
+    if (isReturningPendingTenant) delete update.tenantRentOverride;
 
     ["dob", "dateOfJoiningCollege", "canteenStartDate", "canteenStatusEffectiveFrom", "shiftEffectiveFrom", "shiftDate", "effectiveFrom"].forEach((field) => {
       if (update[field] === "") update[field] = undefined;
@@ -1192,7 +1195,7 @@ const updateFormById = async (req, res) => {
     // legacy snapshots created by that old behavior; rate history starts when
     // the tenant gets their first assigned unit.
     if (existing.intakeStatus === "pending_tenant") {
-      update.rentHistory = [];
+      if (!isReturningPendingTenant) update.rentHistory = [];
     } else if (hasUnassignedQuickAddRentHistory) {
       update.tenantRentOverride = true;
       const currentRent = Number(update.baseRent ?? update.rentAmount ?? existing.baseRent ?? existing.rentAmount ?? 0);
@@ -1212,7 +1215,7 @@ const updateFormById = async (req, res) => {
     // "Pay at Joining (Advance)" is an actual initial rent payment. Older
     // quick-added records stored only the cycle choice, so reconcile those
     // records when they are next saved or assigned.
-    if (existing.intakeStatus === "pending_tenant" || hasUnassignedQuickAddRentHistory) {
+    if (!isReturningPendingTenant && (existing.intakeStatus === "pending_tenant" || hasUnassignedQuickAddRentHistory)) {
       const firstRentStatus = String(update.firstRentStatus || existing.firstRentStatus || "").trim();
       const firstRentMonth = String(update.firstRentMonth || existing.firstRentMonth || "").trim() ||
         deriveFirstRentMonth(update.joiningDate || existing.joiningDate, firstRentStatus);
@@ -1254,6 +1257,7 @@ const updateFormById = async (req, res) => {
       : Boolean(String(updated?.roomNo || "").trim());
     if (
       existing.intakeStatus === "pending_tenant" &&
+      !isReturningPendingTenant &&
       updated?.intakeStatus !== "pending_tenant" &&
       hasAssignedUnit
     ) {
@@ -1296,6 +1300,7 @@ module.exports = {
   getArchivedForms,
   saveLeaveDate,
   restoreForm,
+  sanitizeRestoredFormData,
   archiveForm,
 updateFormById,
   // Forms CRUD

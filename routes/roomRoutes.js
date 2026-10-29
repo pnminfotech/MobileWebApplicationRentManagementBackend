@@ -197,6 +197,7 @@ const authAdmin = require("../middleware/adminAuth");
 const { attachSystemAuthIfPresent } = require("../middleware/saasAuth");
 const { assertUnitCapacity, getUnitQuota } = require("../services/unitQuota");
 const { repairDuplicateRoomBeds } = require("../services/roomBedRepair");
+const { getUnitHistory } = require("../services/unitHistoryQuery");
 const { requireSystemSecurityPin } = require("../middleware/securityPin");
 const {
   scopedQuery,
@@ -332,20 +333,20 @@ function activeTenantQueryForUnit(room) {
 
 router.get("/", async (req, res) => {
   try {
-    await repairDuplicateRoomBeds(scopedQuery(req));
-    if (req.organizationId) {
+    if (!req.trialReadOnly) await repairDuplicateRoomBeds(scopedQuery(req));
+    if (req.organizationId && !req.trialReadOnly) {
       await getUnitQuota(req.organizationId);
     }
     const rooms = await Room.find(scopedQuery(req)).sort({ floorNo: 1, roomNo: 1 });
     res.json(rooms);
   } catch (err) {
-    res.status(500).json({ message: "Internal server error" });
+    res.status(err.status || 500).json({ message: err.status ? err.message : "Internal server error" });
   }
 });
 
 router.get("/usage", async (req, res) => {
   try {
-    await repairDuplicateRoomBeds(scopedQuery(req));
+    if (!req.trialReadOnly) await repairDuplicateRoomBeds(scopedQuery(req));
     const quota = await getUnitQuota(req.organizationId);
     res.json(quota);
   } catch (err) {
@@ -522,9 +523,24 @@ router.get("/room-categories", async (req, res) => {
   }
 });
 
+router.get("/:roomId/history", async (req, res) => {
+  try {
+    const unit = await Room.findOne(scopedQuery(req, { _id: req.params.roomId })).lean();
+    if (!unit || unit.isPlaceholder) return res.status(404).json({ message: "Unit not found" });
+    const bedNo = String(req.query.bedNo || "").trim();
+    if (bedNo && unit.propertyType === "bed" && !(unit.beds || []).some((bed) => normalizeIdentifier(bed.bedNo) === normalizeIdentifier(bedNo))) {
+      return res.status(404).json({ message: "Bed not found" });
+    }
+    res.json(await getUnitHistory(req, unit, bedNo));
+  } catch (error) {
+    console.error("Unable to load unit history:", error.message);
+    res.status(error?.name === "CastError" ? 404 : 500).json({ message: "Unable to load unit history." });
+  }
+});
+
 router.get("/:roomId", async (req, res) => {
   try {
-    await repairDuplicateRoomBeds(scopedQuery(req, { _id: req.params.roomId }));
+    if (!req.trialReadOnly) await repairDuplicateRoomBeds(scopedQuery(req, { _id: req.params.roomId }));
     const unit = await Room.findOne(scopedQuery(req, { _id: req.params.roomId })).lean();
     if (!unit) return res.status(404).json({ message: "Unit not found" });
 
@@ -556,6 +572,7 @@ router.post("/", async (req, res) => {
       meterNo,
       lastMeterReading,
       bedCount,
+      bedNo,
       bedCategory,
       price,
     } = req.body || {};
@@ -638,7 +655,7 @@ router.post("/", async (req, res) => {
     const beds =
       normalizedPropertyType === "bed"
         ? Array.from({ length: normalizedBedCount }, (_, index) => ({
-            bedNo: `B${index + 1}`,
+            bedNo: normalizedBedCount === 1 && String(bedNo || "").trim() ? normalizeIdentifier(bedNo) : `B${index + 1}`,
             bedCategory: normalizeText(bedCategory || "Standard") || "Standard",
             price: normalizedPrice,
           }))

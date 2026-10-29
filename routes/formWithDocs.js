@@ -6,7 +6,7 @@ const path = require("path");
 const router = express.Router();
 
 const Form = require("../models/formModels");
-const Counter = require("../models/counterModel");
+const { assignTenantSerial } = require("../services/tenantSerial");
 const { attachSystemAuthIfPresent } = require("../middleware/saasAuth");
 const authAdmin = require("../middleware/adminAuth");
 const { scopedQuery, scopedCreate } = require("../utils/organizationScope");
@@ -357,13 +357,7 @@ firstRentMonth: body.firstRentMonth,
     }
 
     // ✅ Create new tenant
-    const counter = await Counter.findOneAndUpdate(
-      { name: "form_srno" },
-      { $inc: { seq: 1 } },
-      { new: true, upsert: true }
-    );
-
-    const srNo = counter.seq;
+    const srNo = await assignTenantSerial(req.organizationId);
 
     const rents =
   firstRentStatus === "ADVANCE_PAID"

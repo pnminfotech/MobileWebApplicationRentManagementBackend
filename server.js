@@ -6,7 +6,7 @@ const dotenv = require("dotenv");
 dotenv.config();
 
 const { connectDB } = require("./config/db");
-const { validateSaasJwtSecret } = require("./middleware/saasAuth");
+const { validateSaasJwtSecret, enforceTrialReadOnlyAccess } = require("./middleware/saasAuth");
 const { startSubscriptionReminderJob } = require("./services/subscriptionReminderService");
 const { startRentReminderSmsJob } = require("./services/rentReminderSmsService");
 
@@ -97,6 +97,7 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: process.env.URLENCODED_BODY_LIMIT || "10mb" }));
+app.use("/api", enforceTrialReadOnlyAccess);
 
 app.use("/api/tenant-docs", tenantDocsRoutes);
 app.use("/api/saas", saasRoutes);

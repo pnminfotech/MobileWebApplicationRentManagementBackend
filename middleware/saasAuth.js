@@ -5,6 +5,7 @@ const {
   getLatestSubscription,
   isSubscriptionUsable,
   refreshSubscriptionStateForOrganization,
+  getSubscriptionReadOnlyAccess,
 } = require("../services/subscriptionLifecycle");
 
 const SYSTEM_ADMIN_TOKEN_EXPIRES_IN = process.env.SAAS_JWT_EXPIRES_IN || "7d";
@@ -13,6 +14,38 @@ const SUPERADMIN_IDLE_TIMEOUT_MINUTES = Number(process.env.SAAS_SUPERADMIN_IDLE_
 const SYSTEM_ADMIN_IDLE_TIMEOUT_MINUTES = Number(process.env.SAAS_SYSTEM_ADMIN_IDLE_TIMEOUT_MINUTES || 120);
 const ACTIVITY_WRITE_INTERVAL_MS = 60 * 1000;
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
+
+function isBillingOrSessionRequest(path) {
+  return /^\/api\/saas\/(?:auth\/|payments(?:\/|$)|subscription\/|onboarding\/unit-counts(?:\/|$)|referrals\/quote(?:\/|$)|app\/bootstrap(?:\/|$)|plans(?:\/|$)|me(?:\/|$)|wallet(?:\/|$))/i.test(path);
+}
+
+// Applied before all API routers, including older routes that do not use SaaS auth.
+async function enforceTrialReadOnlyAccess(req, res, next) {
+  if (isBillingOrSessionRequest(req.originalUrl.split("?")[0])) return next();
+  const token = readBearerToken(req);
+  if (!token) return next();
+  try {
+    const payload = jwt.verify(token, getJwtSecret());
+    if (payload.tokenType !== "system" || !payload.organizationId) return next();
+    const [organization, subscription] = await Promise.all([
+      Organization.findById(payload.organizationId),
+      getLatestSubscription(payload.organizationId),
+    ]);
+    const access = getSubscriptionReadOnlyAccess(organization, subscription);
+    if (!access.readOnly && !access.readOnlyUntil) return next();
+    if (!access.readOnly) {
+      return res.status(402).json({ code: "TRIAL_DATA_ACCESS_ENDED", message: "Subscription data access has ended. Please purchase a plan." });
+    }
+    if (!["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+      return res.status(403).json({ code: "TRIAL_READ_ONLY", message: "Your subscription has ended. Data is view only until you purchase a plan." });
+    }
+    req.trialReadOnly = true;
+    return next();
+  } catch (error) {
+    if (error.name === "JsonWebTokenError" || error.name === "TokenExpiredError" || error.name === "NotBeforeError") return next();
+    return next(error);
+  }
+}
 
 function getJwtSecret() {
   const secret = process.env.SAAS_JWT_SECRET || (!IS_PRODUCTION && (
@@ -164,7 +197,8 @@ async function attachSystemAuthIfPresent(req, res, next) {
       if (organization.status === "suspended") {
         return res.status(403).json({ message: "Organization suspended" });
       }
-      if (organization.status === "expired") {
+      if (organization.status === "expired" && !getSubscriptionReadOnlyAccess(organization, lifecycle.subscription).readOnly &&
+          !isBillingOrSessionRequest(String(req.originalUrl || req.url || "").split("?")[0])) {
         return res.status(402).json({
           message: "Subscription expired",
           organizationStatus: organization.status,
@@ -203,7 +237,8 @@ async function requireActiveOrganization(req, res, next) {
     }
 
     const subscription = await getLatestSubscription(req.organization._id);
-    if (!isSubscriptionUsable(req.organization, subscription)) {
+    if (!isSubscriptionUsable(req.organization, subscription) &&
+        !(req.method === "GET" && getSubscriptionReadOnlyAccess(req.organization, subscription).readOnly)) {
       return res.status(402).json({
         message: req.organization.status === "expired" || subscription?.status === "expired"
           ? "Subscription expired"
@@ -228,4 +263,5 @@ module.exports = {
   attachSystemAuthIfPresent,
   requireRole,
   requireActiveOrganization,
+  enforceTrialReadOnlyAccess,
 };

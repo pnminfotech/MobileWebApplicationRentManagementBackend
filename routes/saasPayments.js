@@ -212,6 +212,12 @@ async function activatePaidSubscription(transaction, payload = {}) {
     err.status = 404;
     throw err;
   }
+  if (subscription.status !== "pending_payment" ||
+      (subscription.latestTransactionId && String(subscription.latestTransactionId) !== String(transaction._id))) {
+    const err = new Error("This payment attempt has been replaced or completed. Refresh checkout.");
+    err.status = 409;
+    throw err;
+  }
 
   const previousSubscriptionId =
     transaction.requestPayload?.previousSubscriptionId ||
@@ -580,11 +586,29 @@ router.post("/create", requireSystemAuth, async (req, res) => {
     if (!organization || !subscription) {
       return res.status(404).json({ message: "Payment context not found" });
     }
+    if (transaction.requestPayload?.action !== "subscription_upgrade" &&
+        (subscription.status !== "pending_payment" ||
+          (subscription.latestTransactionId && String(subscription.latestTransactionId) !== String(transaction._id)))) {
+      return res.status(409).json({ message: "This payment attempt has been replaced or completed. Refresh checkout." });
+    }
+    if (!["created", "pending"].includes(transaction.status)) {
+      return res.status(409).json({ message: "This payment attempt is no longer open. Refresh checkout." });
+    }
+    if (Number(transaction.amount || 0) === 0) {
+      const activatedSubscription = await activatePaidSubscription(transaction, {
+        source: "wallet-or-discount",
+        status: "success",
+      });
+      return res.json({
+        transaction,
+        subscription: activatedSubscription,
+        payment: { provider: "wallet", status: "success", message: "No gateway payment is required." },
+      });
+    }
 
     const existingMerchantOrderId =
       transaction.responsePayload?.merchantOrderId ||
-      transaction.responsePayload?.merchantTransactionId ||
-      transaction.merchantTransactionId;
+      transaction.responsePayload?.merchantTransactionId;
     const existingProvider = String(transaction.responsePayload?.provider || transaction.provider || "").toLowerCase();
     if (existingProvider === "phonepe" && existingMerchantOrderId && ["created", "pending"].includes(transaction.status)) {
       try {
@@ -627,12 +651,26 @@ router.post("/create", requireSystemAuth, async (req, res) => {
             },
           });
         }
+        return res.json({ transaction, subscription, payment: transaction.responsePayload });
       } catch (statusError) {
         console.error("create payment existing status check error:", statusError);
+        return res.status(503).json({ message: "Could not verify the previous payment yet. Please try again shortly." });
       }
     }
 
-    const intent = await createPaymentIntent({ transaction, organization, subscription });
+    transaction.requestPayload = {
+      ...(transaction.requestPayload || {}),
+      intentCreatingAt: new Date(),
+    };
+    await transaction.save();
+    let intent;
+    try {
+      intent = await createPaymentIntent({ transaction, organization, subscription });
+    } catch (intentError) {
+      transaction.requestPayload.intentCreatingAt = null;
+      await transaction.save();
+      throw intentError;
+    }
 
     transaction.merchantTransactionId = intent.merchantTransactionId || transaction.merchantTransactionId;
     transaction.status = intent.status || "pending";
@@ -641,6 +679,7 @@ router.post("/create", requireSystemAuth, async (req, res) => {
       requestedBy: req.systemUser._id,
       provider: intent.provider,
       at: new Date(),
+      intentCreatingAt: null,
     };
     transaction.responsePayload = intent;
     await transaction.save();
@@ -730,6 +769,9 @@ async function handleMockSuccess(req, res) {
     if (transaction.status === "success") {
       const subscription = await Subscription.findById(transaction.subscriptionId);
       return res.json({ transaction, subscription, message: "Payment already successful" });
+    }
+    if (!["created", "pending"].includes(transaction.status)) {
+      return res.status(409).json({ message: "This payment attempt is no longer open. Refresh checkout." });
     }
 
     const subscription = await activatePaidSubscription(transaction, {

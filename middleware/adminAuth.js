@@ -4,6 +4,13 @@ const User = require('../models/userModel'); // you already have this model
 const SystemUser = require('../models/SystemUser');
 const Organization = require('../models/Organization');
 const { getJwtSecret, validateSessionActivity } = require('./saasAuth');
+const { getLatestSubscription, getSubscriptionReadOnlyAccess } = require('../services/subscriptionLifecycle');
+
+async function canReadExpiredSubscription(req, organization) {
+  if (req.method !== 'GET') return false;
+  const subscription = await getLatestSubscription(organization._id);
+  return getSubscriptionReadOnlyAccess(organization, subscription).readOnly;
+}
 
 function getSaasJwtSecret() {
   return getJwtSecret();
@@ -62,7 +69,7 @@ async function trySystemAdminAuth(token, req, res, next) {
       res.status(403).json({ message: 'Organization not found' });
       return true;
     }
-    if (organization.status !== 'active') {
+    if (organization.status !== 'active' && !(await canReadExpiredSubscription(req, organization))) {
       res.status(402).json({
         message: 'Subscription payment required',
         organizationStatus: organization.status,
@@ -102,7 +109,7 @@ module.exports = async function adminAuth(req, res, next) {
       if (!organization) {
         return res.status(403).json({ message: 'Organization required' });
       }
-      if (organization.status !== 'active') {
+      if (organization.status !== 'active' && !(await canReadExpiredSubscription(req, organization))) {
         return res.status(402).json({
           message: 'Subscription payment required',
           organizationStatus: organization.status,

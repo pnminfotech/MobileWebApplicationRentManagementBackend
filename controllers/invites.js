@@ -260,7 +260,7 @@ const crypto = require("crypto");
 const mongoose = require("mongoose");
 const Invite = require("../models/Invite");
 const Form = require("../models/formModels");
-const Counter = require("../models/counterModel"); // ✅ same counter you already use
+const { assignTenantSerial } = require("../services/tenantSerial");
 const Room = require("../models/Room");
 const Organization = require("../models/Organization");
 const { sendAdmissionSms } = require("../services/smsService");
@@ -409,26 +409,6 @@ function isActiveBedTenant(tenant, category) {
 }
 
 // ✅ use Counter-based srNo so duplicates don't happen
-async function assignNextSrNoAndUpdateCounter() {
-  const [counter, lastForm] = await Promise.all([
-    Counter.findOne({ name: "form_srno" }).lean(),
-    Form.findOne().sort({ srNo: -1 }).select("srNo").lean(),
-  ]);
-
-  const maxExisting = lastForm ? Number(lastForm.srNo) || 0 : 0;
-  const currentSeq = counter ? Number(counter.seq) || 0 : 0;
-
-  const base = Math.max(maxExisting, currentSeq);
-  const next = base + 1;
-
-  const updated = await Counter.findOneAndUpdate(
-    { name: "form_srno" },
-    { $set: { name: "form_srno", seq: next } },
-    { new: true, upsert: true }
-  );
-
-  return updated.seq; // NEXT srNo
-}
 
 // ===============================
 // CREATE INVITE ✅ (creates draft form + links invite)
@@ -670,7 +650,7 @@ exports.createInvite = async (req, res) => {
     // ✅ 1) Create draft Form
     let createdForm;
     try {
-      const srNo = await assignNextSrNoAndUpdateCounter();
+      const srNo = await assignTenantSerial(req.organizationId);
 
       const initialRents =
         firstRentStatus === "ADVANCE_PAID"

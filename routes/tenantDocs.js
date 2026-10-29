@@ -9,6 +9,7 @@ const Invite = require("../models/Invite");
 const authAdmin = require("../middleware/adminAuth");
 const { attachSystemAuthIfPresent } = require("../middleware/saasAuth");
 const { scopedQuery, scopedCreate, scopedUpdate } = require("../utils/organizationScope");
+const { assignTenantSerial } = require("../services/tenantSerial");
 
 const router = express.Router();
 
@@ -300,8 +301,7 @@ router.post(
       }
 
       // ✅ CREATE (admin direct)
-      const lastForm = await Form.findOne(scopedQuery(req)).sort({ srNo: -1 });
-      const srNo = lastForm ? lastForm.srNo + 1 : 1;
+      const srNo = await assignTenantSerial(req.organizationId);
 
       savedForm = await Form.create(scopedCreate(req, {
         ...updateData,

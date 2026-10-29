@@ -10,6 +10,25 @@ function isPastDate(value, now = new Date()) {
   return date < now;
 }
 
+// An expired subscription remains readable for one calendar month after its final day.
+function getSubscriptionReadOnlyAccess(organization, subscription, now = new Date()) {
+  if (!subscription || !["active", "expired"].includes(subscription.status) ||
+      !["active", "expired"].includes(organization?.status) ||
+      !subscription.endDate || !isPastDate(subscription.endDate, now)) {
+    return { readOnly: false, readOnlyUntil: null };
+  }
+
+  const end = new Date(subscription.endDate);
+  if (Number.isNaN(end.getTime())) return { readOnly: false, readOnlyUntil: null };
+  const day = end.getDate();
+  end.setDate(1);
+  end.setMonth(end.getMonth() + 1);
+  const lastDay = new Date(end.getFullYear(), end.getMonth() + 1, 0).getDate();
+  end.setDate(Math.min(day, lastDay));
+  end.setHours(23, 59, 59, 999);
+  return { readOnly: now <= end, readOnlyUntil: end };
+}
+
 async function getLatestSubscription(organizationId) {
   if (!organizationId) return null;
   return Subscription.findOne({ organizationId }).sort({ createdAt: -1 });
@@ -105,6 +124,8 @@ function isSubscriptionUsable(organization, subscription) {
 }
 
 module.exports = {
+  getSubscriptionReadOnlyAccess,
+  getTrialReadOnlyAccess: getSubscriptionReadOnlyAccess,
   getLatestSubscription,
   expireDueSubscriptions,
   isPastDate,

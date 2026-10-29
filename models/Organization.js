@@ -9,6 +9,26 @@ const unitAllocationSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const ownerDocumentSchema = new mongoose.Schema(
+  {
+    fileId: { type: String, required: true },
+    filePath: { type: String, required: true },
+    originalName: { type: String, default: "" },
+    mimeType: { type: String, default: "image/webp" },
+    uploadedAt: { type: Date, default: Date.now },
+  },
+  { _id: false }
+);
+
+const ownerDocumentsSchema = new mongoose.Schema(
+  {
+    photo: { type: ownerDocumentSchema, default: undefined },
+    aadhaar: { type: ownerDocumentSchema, default: undefined },
+    pan: { type: ownerDocumentSchema, default: undefined },
+  },
+  { _id: false }
+);
+
 const featureSchema = new mongoose.Schema(
   {
     canteenEnabled: { type: Boolean, default: false },
@@ -166,7 +186,13 @@ const organizationSchema = new mongoose.Schema(
     email: { type: String, required: true, trim: true, lowercase: true },
     phone: { type: String, trim: true, default: "" },
     address: { type: String, trim: true, default: "" },
+    // Identity files are returned only by the authenticated owner-documents API.
+    ownerDocuments: { type: ownerDocumentsSchema, default: () => ({}), select: false },
     unitAllocation: { type: unitAllocationSchema, default: () => ({}) },
+    // Existing organizations retain their original allocation and placeholder behavior.
+    onboardingMode: { type: String, enum: ["legacy", "flexible"], default: "legacy" },
+    selectedPropertyTypes: { type: [{ type: String, enum: ["bed", "room", "shop"] }], default: [] },
+    unitCountsConfigured: { type: Boolean, default: false },
     bedCategories: {
       type: [String],
       default: ["Standard", "Single",  "Bunk"],

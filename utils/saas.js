@@ -66,6 +66,28 @@ function calculateSubscriptionPricing(plan, units, referral = null) {
   };
 }
 
+function calculatePendingSubscriptionPricing(subscription, referral = null) {
+  const previous = subscription?.pricing || {};
+  const subtotal = Math.max(0, Math.round(Number(previous.subtotal || 0)));
+  const planDiscountAmount = Math.max(0, Math.round(Number(previous.planDiscountAmount || 0)));
+  const originalAfterPlan = subtotal > 0
+    ? Math.max(0, subtotal - planDiscountAmount)
+    : Math.max(0, Math.round(Number(subscription?.amount || 0) + Number(previous.walletCoinsUsed || 0) + Number(previous.referralDiscountAmount || 0)));
+  const payableAmount = applyDiscount(originalAfterPlan, referral?.discountPercent || 0);
+  return {
+    subtotal: subtotal || originalAfterPlan,
+    planDiscountPercent: Number(previous.planDiscountPercent || 0),
+    planDiscountAmount,
+    referralCode: referral?.code || "",
+    referralOwnerOrganizationId: referral?.ownerOrganizationId || null,
+    referralDiscountPercent: normalizeDiscountPercent(referral?.discountPercent),
+    referralDiscountAmount: originalAfterPlan - payableAmount,
+    referralRewardCoins: Number(referral?.rewardCoins || 0),
+    referralRewardGranted: false,
+    payableAmount,
+  };
+}
+
 function addMonths(date, months) {
   const out = new Date(date);
   out.setMonth(out.getMonth() + Number(months || 0));
@@ -78,6 +100,7 @@ module.exports = {
   normalizeDiscountPercent,
   applyDiscount,
   calculateSubscriptionPricing,
+  calculatePendingSubscriptionPricing,
   calculateSubscriptionAmount,
   addMonths,
 };
