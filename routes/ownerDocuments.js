@@ -5,7 +5,7 @@ const ImageKit = require("imagekit");
 const Organization = require("../models/Organization");
 
 const router = express.Router();
-const documentKinds = new Set(["photo", "aadhaar", "pan"]);
+const documentKinds = new Set(["logo", "photo", "aadhaar", "pan"]);
 const maxFileSize = 5 * 1024 * 1024;
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: maxFileSize, files: 1 } });
 
@@ -57,7 +57,7 @@ router.get("/", async (req, res) => {
     if (!imagekit && Object.values(organization.ownerDocuments || {}).some((item) => item?.filePath)) {
       return res.status(503).json({ message: "Document storage is unavailable." });
     }
-    return res.json({ documents: imagekit ? signedDocuments(organization, imagekit) : { photo: null, aadhaar: null, pan: null } });
+    return res.json({ documents: imagekit ? signedDocuments(organization, imagekit) : { logo: null, photo: null, aadhaar: null, pan: null } });
   } catch (error) {
     console.error("Load owner documents failed:", error);
     return res.status(500).json({ message: "Could not load owner documents." });
@@ -68,11 +68,11 @@ router.put("/:kind", validateKind, receiveFile, async (req, res) => {
   if (!req.file) return res.status(400).json({ message: "Choose a file to upload." });
   const mimeType = String(req.file.mimetype || "").toLowerCase();
   const name = String(req.file.originalname || "");
-  const isImage = ["image/jpeg", "image/png"].includes(mimeType) && /\.(jpe?g|png)$/i.test(name);
-  const isPdf = req.params.kind !== "photo" && mimeType === "application/pdf" && /\.pdf$/i.test(name) &&
+  const isImage = ["image/jpeg", "image/png", "image/webp"].includes(mimeType) && /\.(jpe?g|png|webp)$/i.test(name);
+  const isPdf = !["photo", "logo"].includes(req.params.kind) && mimeType === "application/pdf" && /\.pdf$/i.test(name) &&
     req.file.buffer.subarray(0, 5).toString("ascii") === "%PDF-";
   if (!isImage && !isPdf) {
-    return res.status(400).json({ message: req.params.kind === "photo" ? "The owner photo must be JPG or PNG." : "Choose a JPG, PNG, or PDF file." });
+    return res.status(400).json({ message: ["photo", "logo"].includes(req.params.kind) ? "Choose a JPG, PNG, or WEBP image." : "Choose a JPG, PNG, or PDF file." });
   }
   const imagekit = imageKitClient();
   if (!imagekit) return res.status(503).json({ message: "Document storage is unavailable." });

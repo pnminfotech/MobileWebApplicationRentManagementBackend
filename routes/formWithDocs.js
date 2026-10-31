@@ -151,7 +151,7 @@ function toMealList(value) {
   return [...new Set(raw.map((meal) => String(meal || "").trim().toLowerCase()).filter((meal) => ["breakfast", "lunch", "dinner"].includes(meal)))];
 }
 
-router.post("/forms-with-docs", attachSystemAuthIfPresent, authAdmin, upload.array("documents", 10), async (req, res) => {
+router.post("/forms-with-docs", attachSystemAuthIfPresent, authAdmin, upload.array("documents", 200), async (req, res) => {
   try {
     const body = req.body || {};
     const formId = body.formId ? String(body.formId).trim() : null;
@@ -206,6 +206,25 @@ const firstRentMonth = String(body.firstRentMonth || rentMonth).trim();
       floorNo: body.floorNo,
       bedNo: body.bedNo,
       familyMembers: toNum(body.familyMembers),
+      familyMale: propertyType === "room" ? toNum(body.familyMale) || 0 : 0,
+      familyFemale: propertyType === "room" ? toNum(body.familyFemale) || 0 : 0,
+      familyChildren: propertyType === "room" ? toNum(body.familyChildren) || 0 : 0,
+      otherFamilyMembers: (() => {
+        try {
+          const members = JSON.parse(body.otherFamilyMembers || "[]");
+          return propertyType === "room" && Array.isArray(members)
+            ? members.slice(0, 50).map((member) => ({ name: String(member?.name || ""), age: String(member?.age || ""), occupation: String(member?.occupation || ""), phone: String(member?.phone || "").replace(/\D/g, "").slice(0, 10) }))
+            : [];
+        } catch { return []; }
+      })(),
+      passportNo: propertyType === "room" ? String(body.passportNo || "") : "",
+      panCardNo: propertyType === "room" ? String(body.panCardNo || "") : "",
+      aadhaarCardNo: propertyType === "room" ? String(body.aadhaarCardNo || "") : "",
+      natureOfWork: propertyType === "room" ? String(body.natureOfWork || "") : "",
+      previousAddress: propertyType === "room" ? String(body.previousAddress || "") : "",
+      officeName: propertyType === "room" ? String(body.officeName || "") : "",
+      officeAddress: propertyType === "room" ? String(body.officeAddress || "") : "",
+      officeMobileNo: propertyType === "room" ? String(body.officeMobileNo || "") : "",
       hasCanteen,
       canteenPlanType: hasCanteen ? body.canteenPlanType || "" : "",
       canteenStartDate: hasCanteen ? toDate(body.canteenStartDate) : undefined,

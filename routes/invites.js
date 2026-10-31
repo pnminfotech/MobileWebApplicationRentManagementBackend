@@ -181,10 +181,10 @@ async function submitInviteForm(req, res) {
       return res.status(400).json({ ok: false, message: "Pincode must be 6 digits" });
     }
 
-    if (!isResidentialRoom && !isShop && [
+    if (!isShop && [
       incoming.relative1Phone ?? existingForm.relative1Phone,
       incoming.relative2Phone ?? existingForm.relative2Phone,
-    ].some((value) => !/^\d{10}$/.test(String(value)))) {
+    ].some((value) => String(value ?? "").trim() && !/^\d{10}$/.test(String(value).trim()))) {
       await releaseInvite();
       return res.status(400).json({ ok: false, message: "Contact phone numbers must be 10 digits" });
     }

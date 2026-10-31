@@ -561,6 +561,12 @@ exports.createInvite = async (req, res) => {
             houseNo: prefill.houseNo || undefined,
             nearbyPlace: prefill.nearbyPlace || undefined,
             familyMembers: toNumOrFallback(prefill.familyMembers, 0),
+            familyMale: toNumOrFallback(prefill.familyMale, 0),
+            familyFemale: toNumOrFallback(prefill.familyFemale, 0),
+            familyChildren: toNumOrFallback(prefill.familyChildren, 0),
+            otherFamilyMembers: Array.isArray(prefill.otherFamilyMembers) ? prefill.otherFamilyMembers.slice(0, 50) : [],
+            passportNo: toStr(prefill.passportNo), panCardNo: toStr(prefill.panCardNo), aadhaarCardNo: toStr(prefill.aadhaarCardNo),
+            natureOfWork: toStr(prefill.natureOfWork), previousAddress: toStr(prefill.previousAddress), officeName: toStr(prefill.officeName), officeAddress: toStr(prefill.officeAddress), officeMobileNo: toStr(prefill.officeMobileNo),
             shopName: toStr(prefill.shopName),
             shopBusiness: toStr(prefill.shopBusiness),
             companyAddress: toStr(prefill.companyAddress),
@@ -689,6 +695,12 @@ exports.createInvite = async (req, res) => {
         relative2Name: prefill.relative2Name || undefined,
         relative2Phone: prefill.relative2Phone || undefined,
         familyMembers: toNumOrFallback(prefill.familyMembers, 0),
+        familyMale: toNumOrFallback(prefill.familyMale, 0),
+        familyFemale: toNumOrFallback(prefill.familyFemale, 0),
+        familyChildren: toNumOrFallback(prefill.familyChildren, 0),
+        otherFamilyMembers: Array.isArray(prefill.otherFamilyMembers) ? prefill.otherFamilyMembers.slice(0, 50) : [],
+        passportNo: toStr(prefill.passportNo), panCardNo: toStr(prefill.panCardNo), aadhaarCardNo: toStr(prefill.aadhaarCardNo),
+        natureOfWork: toStr(prefill.natureOfWork), previousAddress: toStr(prefill.previousAddress), officeName: toStr(prefill.officeName), officeAddress: toStr(prefill.officeAddress), officeMobileNo: toStr(prefill.officeMobileNo),
         shopName: toStr(prefill.shopName),
         shopBusiness: toStr(prefill.shopBusiness),
         companyAddress: toStr(prefill.companyAddress),
@@ -826,6 +838,18 @@ exports.createInviteForForm = async (req, res) => {
         canteenMonthlyAmount: existing.canteenMonthlyAmount,
         canteenIncludedMeals: existing.canteenIncludedMeals,
         familyMembers: existing.familyMembers,
+        familyMale: existing.familyMale,
+        familyFemale: existing.familyFemale,
+        familyChildren: existing.familyChildren,
+        otherFamilyMembers: existing.otherFamilyMembers,
+        passportNo: existing.passportNo,
+        panCardNo: existing.panCardNo,
+        aadhaarCardNo: existing.aadhaarCardNo,
+        natureOfWork: existing.natureOfWork,
+        previousAddress: existing.previousAddress,
+        officeName: existing.officeName,
+        officeAddress: existing.officeAddress,
+        officeMobileNo: existing.officeMobileNo,
         shopName: existing.shopName,
         shopBusiness: existing.shopBusiness,
         address: existing.address,
@@ -834,6 +858,12 @@ exports.createInviteForForm = async (req, res) => {
         state: existing.state,
         houseNo: existing.houseNo,
         nearbyPlace: existing.nearbyPlace,
+        relative1Relation: existing.relative1Relation,
+        relative1Name: existing.relative1Name,
+        relative1Phone: existing.relative1Phone,
+        relative2Relation: existing.relative2Relation,
+        relative2Name: existing.relative2Name,
+        relative2Phone: existing.relative2Phone,
         companyAddress: existing.companyAddress,
         dateOfJoiningCollege: existing.dateOfJoiningCollege,
         dob: existing.dob,
@@ -890,7 +920,7 @@ exports.validateInvite = async (req, res) => {
 
     const invDoc = await Invite.findOne({ token }).populate(
       "usedByFormId",
-      "srNo name phoneNo category propertyType roomId hasWing wingName floorNo roomNo bedNo joiningDate baseRent rentAmount depositAmount firstRentStatus firstRentMonth paymentMode hasCanteen canteenPlanType canteenStartDate canteenMonthlyAmount canteenIncludedMeals documents intakeStatus address pincode city state houseNo nearbyPlace relativeAddress1 relative1Relation relative1Name relative1Phone relative2Relation relative2Name relative2Phone familyMembers shopName shopBusiness companyAddress dateOfJoiningCollege dob"
+      "srNo name phoneNo category propertyType roomId hasWing wingName floorNo roomNo bedNo joiningDate baseRent rentAmount depositAmount firstRentStatus firstRentMonth paymentMode hasCanteen canteenPlanType canteenStartDate canteenMonthlyAmount canteenIncludedMeals documents intakeStatus address pincode city state houseNo nearbyPlace relativeAddress1 relative1Relation relative1Name relative1Phone relative2Relation relative2Name relative2Phone familyMembers familyMale familyFemale familyChildren otherFamilyMembers passportNo panCardNo aadhaarCardNo natureOfWork previousAddress officeName officeAddress officeMobileNo shopName shopBusiness companyAddress dateOfJoiningCollege dob"
     );
     if (!invDoc) return res.status(404).json({ ok: false, message: "Invite not found" });
 
@@ -915,7 +945,7 @@ exports.validateInvite = async (req, res) => {
       "address", "pincode", "city", "state", "houseNo", "nearbyPlace", "relativeAddress1",
       "relative1Relation", "relative1Name", "relative1Phone",
       "relative2Relation", "relative2Name", "relative2Phone",
-      "name", "phoneNo", "category", "propertyType", "roomId", "hasWing", "wingName", "floorNo", "roomNo", "bedNo", "joiningDate", "baseRent", "rentAmount", "depositAmount", "firstRentStatus", "firstRentMonth", "paymentMode", "hasCanteen", "canteenPlanType", "canteenStartDate", "canteenMonthlyAmount", "canteenIncludedMeals", "familyMembers", "shopName", "shopBusiness", "companyAddress", "dateOfJoiningCollege", "dob",
+      "name", "phoneNo", "category", "propertyType", "roomId", "hasWing", "wingName", "floorNo", "roomNo", "bedNo", "joiningDate", "baseRent", "rentAmount", "depositAmount", "firstRentStatus", "firstRentMonth", "paymentMode", "hasCanteen", "canteenPlanType", "canteenStartDate", "canteenMonthlyAmount", "canteenIncludedMeals", "familyMembers", "familyMale", "familyFemale", "familyChildren", "otherFamilyMembers", "passportNo", "panCardNo", "aadhaarCardNo", "natureOfWork", "previousAddress", "officeName", "officeAddress", "officeMobileNo", "shopName", "shopBusiness", "companyAddress", "dateOfJoiningCollege", "dob",
     ]) {
       if ((prefill[key] === undefined || prefill[key] === null || prefill[key] === "") && existingForm?.[key]) {
         prefill[key] = existingForm[key];

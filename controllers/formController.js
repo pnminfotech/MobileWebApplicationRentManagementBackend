@@ -1064,6 +1064,7 @@ const updateFormById = async (req, res) => {
       "name","phoneNo","address","joiningDate","dob","relativeAddress1",
       "propertyType","category","wingName","roomId","floorNo","roomNo","bedNo","baseRent","rentAmount","tenantRentOverride","familyMembers","hasCanteen","canteenPlanType","canteenStartDate","canteenStatusEffectiveFrom","canteenMonthlyAmount","canteenIncludedMeals","canteenMealPrices","canteenStatusHistory","shopName","shopBusiness","companyAddress","dateOfJoiningCollege","depositAmount",
       "firstRentStatus","firstRentMonth",
+      "familyMale","familyFemale","familyChildren","otherFamilyMembers","passportNo","panCardNo","aadhaarCardNo","natureOfWork","previousAddress","officeName","officeAddress","officeMobileNo",
       "relative1Relation","relative1Name","relative1Phone",
       "relative2Relation","relative2Name","relative2Phone",
       "pincode","city","state","houseNo","nearbyPlace",
@@ -1131,7 +1132,7 @@ const updateFormById = async (req, res) => {
     ["dob", "dateOfJoiningCollege", "canteenStartDate", "canteenStatusEffectiveFrom", "shiftEffectiveFrom", "shiftDate", "effectiveFrom"].forEach((field) => {
       if (update[field] === "") update[field] = undefined;
     });
-    ["phoneNo", "depositAmount", "baseRent", "rentAmount", "familyMembers", "canteenMonthlyAmount"].forEach((field) => {
+    ["phoneNo", "depositAmount", "baseRent", "rentAmount", "familyMembers", "familyMale", "familyFemale", "familyChildren", "canteenMonthlyAmount"].forEach((field) => {
       if (update[field] === "") update[field] = undefined;
       if (update[field] !== undefined && update[field] !== null) {
         const number = Number(update[field]);

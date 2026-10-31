@@ -22,6 +22,7 @@ const ownerDocumentSchema = new mongoose.Schema(
 
 const ownerDocumentsSchema = new mongoose.Schema(
   {
+    logo: { type: ownerDocumentSchema, default: undefined },
     photo: { type: ownerDocumentSchema, default: undefined },
     aadhaar: { type: ownerDocumentSchema, default: undefined },
     pan: { type: ownerDocumentSchema, default: undefined },
