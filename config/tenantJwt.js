@@ -1,7 +1,10 @@
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 function getTenantJwtSecret() {
-  const secret = process.env.TENANT_JWT_SECRET || (!IS_PRODUCTION && (
+  // Keep tenant login available on deployments that already configured the
+  // required SaaS signing secret but have not set a separate tenant secret.
+  // TENANT_JWT_SECRET remains preferred so deployments can isolate tokens.
+  const secret = process.env.TENANT_JWT_SECRET || process.env.SAAS_JWT_SECRET || (!IS_PRODUCTION && (
     process.env.JWT_SECRET || process.env.JWT_TOKEN || "dev_secret"
   ));
 
