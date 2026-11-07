@@ -794,7 +794,7 @@ exports.createInvite = async (req, res) => {
     });
   } catch (err) {
     console.error("Create invite failed:", err);
-    return res.status(500).json({
+    return res.status(err?.http || 500).json({
       ok: false,
       message: err?.message || "Failed to create invite",
     });
@@ -909,7 +909,7 @@ exports.createInviteForForm = async (req, res) => {
     });
   } catch (err) {
     console.error("Create invite for form failed:", err);
-    return res.status(500).json({ ok: false, message: err?.message || "Failed to create invite" });
+    return res.status(err?.http || 500).json({ ok: false, message: err?.message || "Failed to create invite" });
   }
 };
 

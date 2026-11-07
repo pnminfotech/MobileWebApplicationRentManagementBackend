@@ -5,7 +5,7 @@ const ImageKit = require("imagekit");
 const Organization = require("../models/Organization");
 
 const router = express.Router();
-const documentKinds = new Set(["logo", "photo", "aadhaar", "pan"]);
+const documentKinds = new Set(["logo", "photo", "aadhaar", "pan", "qr"]);
 const maxFileSize = 5 * 1024 * 1024;
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: maxFileSize, files: 1 } });
 
@@ -69,10 +69,10 @@ router.put("/:kind", validateKind, receiveFile, async (req, res) => {
   const mimeType = String(req.file.mimetype || "").toLowerCase();
   const name = String(req.file.originalname || "");
   const isImage = ["image/jpeg", "image/png", "image/webp"].includes(mimeType) && /\.(jpe?g|png|webp)$/i.test(name);
-  const isPdf = !["photo", "logo"].includes(req.params.kind) && mimeType === "application/pdf" && /\.pdf$/i.test(name) &&
+  const isPdf = !["photo", "logo", "qr"].includes(req.params.kind) && mimeType === "application/pdf" && /\.pdf$/i.test(name) &&
     req.file.buffer.subarray(0, 5).toString("ascii") === "%PDF-";
   if (!isImage && !isPdf) {
-    return res.status(400).json({ message: ["photo", "logo"].includes(req.params.kind) ? "Choose a JPG, PNG, or WEBP image." : "Choose a JPG, PNG, or PDF file." });
+    return res.status(400).json({ message: ["photo", "logo", "qr"].includes(req.params.kind) ? "Choose a JPG, PNG, or WEBP image." : "Choose a JPG, PNG, or PDF file." });
   }
   const imagekit = imageKitClient();
   if (!imagekit) return res.status(503).json({ message: "Document storage is unavailable." });

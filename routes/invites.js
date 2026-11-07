@@ -273,7 +273,7 @@ async function submitInviteForm(req, res) {
       ).catch(() => {});
     }
     console.error("Invite submit failed:", err);
-    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+    return res.status(err?.http || 500).json({ ok: false, message: err?.message || "Server error" });
   }
 }
 

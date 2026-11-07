@@ -368,6 +368,12 @@ const trackUpdate = (update = {}) => Object.entries(update).some(([key, value]) 
 const reportHistoryError = (error) => console.error("Unable to update unit history:", error.message);
 
 formSchema.pre("save", async function () {
+  if (!this.isNew && !this.isModified("phoneNo") && !this.isModified("propertyType")) return;
+  const { assertTenantPhoneAvailable } = require("../utils/phoneIdentity");
+  await assertTenantPhoneAvailable(this.phoneNo, { excludeTenantId: this._id });
+});
+
+formSchema.pre("save", async function () {
   this.$locals.trackUnitHistory = this.isNew || [...historyFields].some((field) => this.isModified(field));
   delete this.$locals.unitHistoryBefore;
   if (!this.$locals.trackUnitHistory || this.isNew) return;
@@ -383,6 +389,17 @@ formSchema.post("save", async function (doc) {
   catch (error) { reportHistoryError(error); }
 });
 formSchema.pre("findOneAndUpdate", async function () {
+  const update = this.getUpdate() || {};
+  const updatedPhone = update.phoneNo ?? update.$set?.phoneNo ?? update.$setOnInsert?.phoneNo;
+  const updatesPropertyType = update.propertyType !== undefined || update.$set?.propertyType !== undefined;
+  if (updatedPhone !== undefined || updatesPropertyType) {
+    let currentQuery = this.model.findOne(this.getQuery()).select("_id phoneNo");
+    if (this.getOptions().session) currentQuery = currentQuery.session(this.getOptions().session);
+    const current = await currentQuery.lean();
+    const { assertTenantPhoneAvailable } = require("../utils/phoneIdentity");
+    await assertTenantPhoneAvailable(updatedPhone ?? current?.phoneNo, { excludeTenantId: current?._id });
+  }
+
   if (!trackUpdate(this.getUpdate())) return;
   try {
     let query = this.model.findOne(this.getQuery()).lean();

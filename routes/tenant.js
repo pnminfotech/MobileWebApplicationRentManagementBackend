@@ -277,6 +277,8 @@ const mongoose = require('mongoose');
 const QRCode = require('qrcode');
 
 const Form = require('../models/formModels');
+const Room = require('../models/Room');
+const Organization = require('../models/Organization');
 const OtpSession = require('../models/OtpSession');
 const authTenant = require('../middleware/tenantAuth');
 const Payment = require('../models/Payment');
@@ -285,11 +287,13 @@ const sharp = require('sharp');
 const ImageKit = require('imagekit');
 const { getTenantJwtSecret } = require('../config/tenantJwt');
 const { sendTenantLoginOtp } = require('../services/smsService');
+const { getUnpaidRentBeforeDate, getCurrentMonthlyRent } = require('./_helpers/rentHistory');
 const {
   createAuthRateLimit,
   requestIp,
   challengeIdentifier,
 } = require('../middleware/authRateLimit');
+const { findSystemAdminPhoneMatches, phoneIdentityNumberVariants } = require('../utils/phoneIdentity');
 
 /* ------------------------------------------------------------------ */
 /* Helpers kept in this file (no new files created)                    */
@@ -386,9 +390,25 @@ const tenantOtpVerifyIpLimit = createAuthRateLimit({
 const tenantOtpVerifyChallengeLimit = createAuthRateLimit({
   name: 'tenant-otp-verify-challenge',
   windowMs: 15 * 60 * 1000,
-  max: 5,
-  keyFromRequest: challengeIdentifier,
+  max: 10,
+  keyFromRequest: (req) => String(req.body?.otpId || challengeIdentifier(req)).trim(),
 });
+
+const TENANT_OTP_CODE_TTL_MS = 5 * 60 * 1000;
+const TENANT_OTP_CHALLENGE_TTL_MS = 24 * 60 * 60 * 1000;
+const TENANT_OTP_MAX_ATTEMPTS = 3;
+const TENANT_OTP_MAX_RESENDS = 2;
+
+function publicTenantOtpState(challenge) {
+  return {
+    otpId: String(challenge._id),
+    codeExpiresAt: challenge.codeExpiresAt || challenge.expiresAt,
+    resendAvailableAt: challenge.resendAvailableAt || challenge.codeExpiresAt || challenge.expiresAt,
+    attempts: Number(challenge.attempts || 0),
+    attemptsRemaining: Math.max(0, TENANT_OTP_MAX_ATTEMPTS - Number(challenge.attempts || 0)),
+    resendCount: Number(challenge.resendCount || 0),
+  };
+}
 
 function hashTenantOtp(otpId, phone, code) {
   return crypto
@@ -411,9 +431,19 @@ router.post('/auth/request-otp', tenantOtpRequestIpLimit, tenantOtpRequestPhoneL
       return res.status(400).json({ message: 'Enter a valid 10-digit mobile number.' });
     }
 
-    const tenant = await Form.findOne({
-      $or: [{ phoneNo: phoneNorm }, { phoneNo: Number(phoneNorm) }],
-    });
+    const [tenants, systemAdmins] = await Promise.all([
+      Form.find({
+        phoneNo: { $in: phoneIdentityNumberVariants(phoneNorm) },
+      }).limit(2),
+      findSystemAdminPhoneMatches(phoneNorm),
+    ]);
+    if (systemAdmins.length) {
+      return res.status(409).json({ message: 'This mobile number belongs to a system admin and cannot be used for tenant login.' });
+    }
+    if (tenants.length > 1) {
+      return res.status(409).json({ message: 'This mobile number is linked to multiple tenant records. Contact the property administrator to resolve the duplicate.' });
+    }
+    const tenant = tenants[0] || null;
     const genericResponse = {
       ok: true,
       message: 'If this number is registered, a verification code has been sent.',
@@ -421,15 +451,35 @@ router.post('/auth/request-otp', tenantOtpRequestIpLimit, tenantOtpRequestPhoneL
     };
     if (!tenant) return res.json(genericResponse);
 
+    const now = new Date();
+    const activeChallenge = await OtpSession.findOne({
+      phone: phoneNorm,
+      purpose: 'tenant_login',
+      usedAt: null,
+      expiresAt: { $gt: now },
+    }).sort({ createdAt: -1 });
+    if (activeChallenge) {
+      const resendAvailableAt = activeChallenge.resendAvailableAt || activeChallenge.codeExpiresAt || activeChallenge.expiresAt;
+      if (resendAvailableAt > now) {
+        return res.status(429).json({
+          message: 'Wait for the 5-minute timer before requesting another OTP.',
+          ...publicTenantOtpState(activeChallenge),
+        });
+      }
+      activeChallenge.usedAt = now;
+      await activeChallenge.save();
+    }
+
     const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
-    await OtpSession.deleteMany({ phone: phoneNorm, purpose: 'tenant_login' });
     const otpId = new mongoose.Types.ObjectId();
     const challenge = await OtpSession.create({
       _id: otpId,
       phone: phoneNorm,
       codeHash: hashTenantOtp(otpId, phoneNorm, code),
       purpose: 'tenant_login',
-      expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+      codeExpiresAt: new Date(now.getTime() + TENANT_OTP_CODE_TTL_MS),
+      resendAvailableAt: new Date(now.getTime() + TENANT_OTP_CODE_TTL_MS),
+      expiresAt: new Date(now.getTime() + TENANT_OTP_CHALLENGE_TTL_MS),
     });
 
     let delivery;
@@ -446,13 +496,116 @@ router.post('/auth/request-otp', tenantOtpRequestIpLimit, tenantOtpRequestPhoneL
         await OtpSession.deleteOne({ _id: challenge._id });
         return res.status(503).json({ message: 'Tenant SMS verification is not configured. Please contact support.' });
       }
-      return res.json({ ...genericResponse, otpId: String(challenge._id), devCode: code });
+      return res.json({ ...genericResponse, ...publicTenantOtpState(challenge), devCode: code });
     }
 
-    return res.json({ ...genericResponse, otpId: String(challenge._id) });
+    return res.json({ ...genericResponse, ...publicTenantOtpState(challenge) });
   } catch (error) {
     console.error('tenant OTP request failed:', error?.message || error);
     return res.status(500).json({ message: 'Unable to request a verification code.' });
+  }
+});
+
+router.post('/auth/challenge/status', async (req, res) => {
+  try {
+    const phone = normalizePhone(req.body?.phone);
+    const otpId = String(req.body?.otpId || '').trim();
+    if (!validTenantPhone(phone) || !mongoose.Types.ObjectId.isValid(otpId)) {
+      return res.status(400).json({ message: 'Sign-in request expired. Request a new OTP.' });
+    }
+    const challenge = await OtpSession.findOne({
+      _id: otpId,
+      phone,
+      purpose: 'tenant_login',
+      usedAt: null,
+      expiresAt: { $gt: new Date() },
+    });
+    if (!challenge) return res.status(404).json({ message: 'Sign-in request expired. Request a new OTP.' });
+    return res.json(publicTenantOtpState(challenge));
+  } catch (error) {
+    console.error('tenant OTP status failed:', error?.message || error);
+    return res.status(500).json({ message: 'Unable to restore the sign-in request.' });
+  }
+});
+
+router.post('/auth/resend-otp', tenantOtpRequestIpLimit, tenantOtpRequestPhoneLimit, async (req, res) => {
+  try {
+    const phone = normalizePhone(req.body?.phone);
+    const otpId = String(req.body?.otpId || '').trim();
+    if (!validTenantPhone(phone) || !mongoose.Types.ObjectId.isValid(otpId)) {
+      return res.status(400).json({ message: 'Sign-in request expired. Request a new OTP.' });
+    }
+
+    const now = new Date();
+    const challenge = await OtpSession.findOne({
+      _id: otpId,
+      phone,
+      purpose: 'tenant_login',
+      usedAt: null,
+      expiresAt: { $gt: now },
+    });
+    if (!challenge) return res.status(400).json({ message: 'Sign-in request expired. Request a new OTP.' });
+
+    const resendAvailableAt = challenge.resendAvailableAt || challenge.codeExpiresAt || challenge.expiresAt;
+    if (resendAvailableAt > now) {
+      return res.status(429).json({
+        message: 'Wait for the 5-minute timer before requesting another OTP.',
+        ...publicTenantOtpState(challenge),
+      });
+    }
+    if (Number(challenge.resendCount || 0) >= TENANT_OTP_MAX_RESENDS) {
+      return res.status(429).json({
+        message: 'You have used both OTP resends. Request a fresh OTP to continue.',
+        restartRequired: true,
+        ...publicTenantOtpState(challenge),
+      });
+    }
+
+    const [tenants, systemAdmins] = await Promise.all([
+      Form.find({ phoneNo: { $in: phoneIdentityNumberVariants(phone) } }).limit(2),
+      findSystemAdminPhoneMatches(phone),
+    ]);
+    if (systemAdmins.length) {
+      challenge.usedAt = now;
+      await challenge.save();
+      return res.status(409).json({ message: 'This mobile number belongs to a system admin and cannot be used for tenant login.' });
+    }
+    if (tenants.length !== 1) {
+      challenge.usedAt = now;
+      await challenge.save();
+      return res.status(409).json({ message: 'This mobile number must belong to exactly one tenant record to sign in.' });
+    }
+
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    challenge.codeHash = hashTenantOtp(challenge._id, phone, code);
+    challenge.codeExpiresAt = new Date(now.getTime() + TENANT_OTP_CODE_TTL_MS);
+    challenge.resendAvailableAt = new Date(now.getTime() + TENANT_OTP_CODE_TTL_MS);
+    challenge.expiresAt = new Date(now.getTime() + TENANT_OTP_CHALLENGE_TTL_MS);
+    challenge.attempts = 0;
+    challenge.resendCount = Number(challenge.resendCount || 0) + 1;
+    await challenge.save();
+
+    let delivery;
+    try {
+      delivery = await sendTenantLoginOtp({ tenant: tenants[0], code });
+    } catch (error) {
+      challenge.usedAt = new Date();
+      await challenge.save();
+      console.error('tenant OTP resend delivery failed:', error?.message || error);
+      return res.status(503).json({ message: 'Unable to resend the OTP right now. Please try again later.' });
+    }
+    if (!delivery?.sent && process.env.NODE_ENV === 'production') {
+      challenge.usedAt = new Date();
+      await challenge.save();
+      return res.status(503).json({ message: 'Tenant SMS verification is not configured. Please contact support.' });
+    }
+    return res.json({
+      ...publicTenantOtpState(challenge),
+      ...(delivery?.sent ? {} : { devCode: code }),
+    });
+  } catch (error) {
+    console.error('tenant OTP resend failed:', error?.message || error);
+    return res.status(500).json({ message: 'Unable to resend the OTP. Please try again.' });
   }
 });
 
@@ -471,9 +624,29 @@ router.post('/auth/verify', tenantOtpVerifyIpLimit, tenantOtpVerifyChallengeLimi
       phone: phoneNorm,
       purpose: 'tenant_login',
       expiresAt: { $gt: now },
-      attempts: { $lt: 5 },
+      usedAt: null,
+      attempts: { $lt: TENANT_OTP_MAX_ATTEMPTS },
+      $or: [
+        { codeExpiresAt: { $gt: now } },
+        { codeExpiresAt: null, expiresAt: { $gt: now } },
+      ],
     });
     if (!challenge) {
+      const lockedChallenge = await OtpSession.findOne({
+        _id: otpId,
+        phone: phoneNorm,
+        purpose: 'tenant_login',
+        usedAt: null,
+        expiresAt: { $gt: now },
+        attempts: { $gte: TENANT_OTP_MAX_ATTEMPTS },
+      });
+      if (lockedChallenge) {
+        return res.status(429).json({
+          message: 'Too many incorrect OTP attempts. Request a new code when the 5-minute timer ends.',
+          locked: true,
+          ...publicTenantOtpState(lockedChallenge),
+        });
+      }
       return res.status(400).json({ message: 'The verification code is invalid or expired. Request a new code.' });
     }
 
@@ -483,16 +656,47 @@ router.post('/auth/verify', tenantOtpVerifyIpLimit, tenantOtpVerifyChallengeLimi
       Buffer.from(expectedHash, 'hex')
     );
     if (!matches) {
-      await OtpSession.updateOne(
-        { _id: challenge._id, attempts: { $lt: 5 }, expiresAt: { $gt: now } },
-        { $inc: { attempts: 1 } }
+      const updatedChallenge = await OtpSession.findOneAndUpdate(
+        {
+          _id: challenge._id,
+          codeHash: challenge.codeHash,
+          attempts: { $lt: TENANT_OTP_MAX_ATTEMPTS },
+          expiresAt: { $gt: now },
+          usedAt: null,
+          $or: [
+            { codeExpiresAt: { $gt: now } },
+            { codeExpiresAt: null, expiresAt: { $gt: now } },
+          ],
+        },
+        { $inc: { attempts: 1 } },
+        { new: true }
       );
-      return res.status(400).json({ message: 'The verification code is incorrect.' });
+      if (!updatedChallenge) return res.status(400).json({ message: 'The verification code is invalid or expired. Request a new code.' });
+      const locked = updatedChallenge.attempts >= TENANT_OTP_MAX_ATTEMPTS;
+      return res.status(locked ? 429 : 400).json({
+        message: locked
+          ? 'Too many incorrect OTP attempts. Request a new code when the 5-minute timer ends.'
+          : 'The verification code is incorrect.',
+        locked,
+        ...publicTenantOtpState(updatedChallenge),
+      });
     }
 
-    const tenant = await Form.findOne({
-      $or: [{ phoneNo: phoneNorm }, { phoneNo: Number(phoneNorm) }],
-    });
+    const [tenants, systemAdmins] = await Promise.all([
+      Form.find({
+        phoneNo: { $in: phoneIdentityNumberVariants(phoneNorm) },
+      }).limit(2),
+      findSystemAdminPhoneMatches(phoneNorm),
+    ]);
+    if (systemAdmins.length) {
+      await OtpSession.deleteOne({ _id: challenge._id });
+      return res.status(409).json({ message: 'This mobile number belongs to a system admin and cannot be used for tenant login.' });
+    }
+    if (tenants.length > 1) {
+      await OtpSession.deleteOne({ _id: challenge._id });
+      return res.status(409).json({ message: 'This mobile number is linked to multiple tenant records. Contact the property administrator to resolve the duplicate.' });
+    }
+    const tenant = tenants[0] || null;
     if (!tenant) {
       await OtpSession.deleteOne({ _id: challenge._id });
       return res.status(400).json({ message: 'The verification code is invalid or expired. Request a new code.' });
@@ -504,7 +708,12 @@ router.post('/auth/verify', tenantOtpVerifyIpLimit, tenantOtpVerifyChallengeLimi
       codeHash: expectedHash,
       purpose: 'tenant_login',
       expiresAt: { $gt: now },
-      attempts: { $lt: 5 },
+      usedAt: null,
+      attempts: { $lt: TENANT_OTP_MAX_ATTEMPTS },
+      $or: [
+        { codeExpiresAt: { $gt: now } },
+        { codeExpiresAt: null, expiresAt: { $gt: now } },
+      ],
     });
     if (!consumed) {
       return res.status(400).json({ message: 'The verification code is invalid or expired. Request a new code.' });
@@ -573,27 +782,28 @@ router.post('/docs', authTenant, imageUpload.array('documents', 10), async (req,
 router.get('/rents', authTenant, async (req, res) => {
   const t = req.tenant;
   const now = new Date();
-  const y = now.getFullYear();
-  const paidSet = new Set(
-    (t.rents || [])
-      .filter(r => r?.date && Number(r.rentAmount) > 0)
-      .map(r => { const d = new Date(r.date); return `${d.getFullYear()}-${d.getMonth()}`; })
-  );
-
-  const base = Number(t.baseRent || 0);
-  let totalDue = 0;
-  const join = t.joiningDate ? new Date(t.joiningDate) : null;
-  const startOfYear = new Date(y, 0, 1);
-  const startAfterJoin = join ? new Date(join.getFullYear(), join.getMonth() + 1, 1) : startOfYear;
-  const start = startAfterJoin > startOfYear ? startAfterJoin : startOfYear;
-
-  const cursor = new Date(start);
-  while (cursor.getFullYear() === y && cursor <= now) {
-    const key = `${cursor.getFullYear()}-${cursor.getMonth()}`;
-    if (!paidSet.has(key)) totalDue += base;
-    cursor.setMonth(cursor.getMonth() + 1);
+  const roomsQuery = t.organizationId ? { organizationId: t.organizationId } : {};
+  const rooms = await Room.find(roomsQuery).lean();
+  const dueMonths = getUnpaidRentBeforeDate(t, now, rooms);
+  const totalDue = dueMonths.reduce((sum, month) => sum + Number(month.outstanding || 0), 0);
+  const baseRent = getCurrentMonthlyRent(t, rooms);
+  let paymentQrUrl = '';
+  if (t.organizationId) {
+    const organization = await Organization.findById(t.organizationId).select('+ownerDocuments').lean();
+    const paymentQr = organization?.ownerDocuments?.qr;
+    const imagekit = getImageKit();
+    if (paymentQr?.filePath && imagekit) {
+      paymentQrUrl = imagekit.url({ path: paymentQr.filePath, signed: true, expireSeconds: 3600 });
+    }
   }
-  res.json({ currentYear: y, totalDue, rents: t.rents || [] });
+  res.json({
+    currentYear: now.getFullYear(),
+    baseRent,
+    totalDue,
+    dueMonths,
+    paymentQrUrl,
+    rents: t.rents || [],
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -679,6 +889,32 @@ router.get('/payments/my', authTenant, async (req, res) => {
   if (req.tenant.organizationId) query.organizationId = req.tenant.organizationId;
   const list = await Payment.find(query).sort({ createdAt: -1 });
   res.json(list);
+});
+
+router.patch('/payments/:id/read', authTenant, async (req, res) => {
+  const query = { _id: req.params.id, tenant: req.tenant._id };
+  if (req.tenant.organizationId) query.organizationId = req.tenant.organizationId;
+  const payment = await Payment.findOne(query);
+  if (!payment) return res.status(404).json({ message: 'Payment notification not found' });
+  if (!['confirmed', 'rejected'].includes(payment.status)) {
+    return res.status(400).json({ message: 'Payment report has no final review yet' });
+  }
+
+  payment.tenantReadAt = new Date();
+  await payment.save();
+  res.json({ ok: true, paymentId: payment._id, tenantReadAt: payment.tenantReadAt });
+});
+
+router.patch('/payments/read-all', authTenant, async (req, res) => {
+  const query = {
+    tenant: req.tenant._id,
+    status: { $in: ['confirmed', 'rejected'] },
+    $or: [{ tenantReadAt: null }, { tenantReadAt: { $exists: false } }],
+  };
+  if (req.tenant.organizationId) query.organizationId = req.tenant.organizationId;
+
+  const result = await Payment.updateMany(query, { $set: { tenantReadAt: new Date() } });
+  res.json({ ok: true, modifiedCount: result.modifiedCount ?? result.nModified ?? 0 });
 });
 
 router.post('/payments/report', authTenant, async (req, res) => {

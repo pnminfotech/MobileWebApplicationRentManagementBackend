@@ -26,6 +26,7 @@ const ownerDocumentsSchema = new mongoose.Schema(
     photo: { type: ownerDocumentSchema, default: undefined },
     aadhaar: { type: ownerDocumentSchema, default: undefined },
     pan: { type: ownerDocumentSchema, default: undefined },
+    qr: { type: ownerDocumentSchema, default: undefined },
   },
   { _id: false }
 );

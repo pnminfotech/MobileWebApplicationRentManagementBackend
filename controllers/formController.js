@@ -398,8 +398,8 @@ const saveForm = async (req, res) => {
       });
     }
 
-    res.status(500).json({
-      message: "Error submitting form",
+    res.status(error?.http || 500).json({
+      message: error?.http === 409 ? error.message : "Error submitting form",
       error: error.message,
     });
   }
@@ -1013,7 +1013,7 @@ const updateProfile = async (req, res) => {
 
     res.status(200).json(updatedForm);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error });
+    res.status(error?.http || 500).json({ message: error?.http === 409 ? error.message : "Server Error", error: error.message });
   }
 };
 

@@ -37,7 +37,7 @@ async function pushAttendanceNotif(tenant, payload = {}) {
       bedNo: tenant.bedNo,
       type: "system", // distinguish from payment / leave
       payload,        // { kind, whenISO, where, reason, ... }
-      status: "sent", // mark as sent so it appears for admin
+      status: "unread",
     });
 
     console.log("✅ Attendance notification created successfully.");
@@ -60,6 +60,7 @@ const handleLateRequest = async (req, res, next) => {
       organizationId: req.tenant.organizationId || null,
       tenantId: req.tenant._id,
       status: "pending",
+      approvalStatus: { $in: ["pending", null] },
     });
     if (pending)
       return res.status(400).json({
@@ -85,6 +86,9 @@ const doc = await Attendance.findOneAndUpdate(
       scheduledAt,
       lateReason: reason || "",
       status: "pending",
+      approvalStatus: "pending",
+      approvalNote: "",
+      reviewedAt: null,
       isLate: true,
       lateReportedAt: new Date(),
     },
@@ -101,6 +105,7 @@ const doc = await Attendance.findOneAndUpdate(
       reason,
       scheduledAt,
       status: "pending",
+      attendanceId: String(doc._id),
     });
 
     res.json({ ok: true, attendance: doc });
@@ -119,7 +124,7 @@ const handleCheckIn = async (req, res, next) => {
 
     // Find the latest pending record
     const doc = await Attendance.findOneAndUpdate(
-      { organizationId: req.tenant.organizationId || null, tenantId: req.tenant._id, status: "pending" },
+      { organizationId: req.tenant.organizationId || null, tenantId: req.tenant._id, status: "pending", approvalStatus: "approved" },
       {
         $set: {
           checkIn: { at: now, where: { lat, lng, accuracy, address } },

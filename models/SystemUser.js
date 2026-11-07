@@ -54,6 +54,12 @@ systemUserSchema.methods.compareSecurityPin = function compareSecurityPin(candid
   return bcrypt.compare(String(candidate || ""), this.securityPin);
 };
 
+systemUserSchema.pre("save", async function () {
+  if (this.role !== "system_admin" || (!this.isNew && !this.isModified("phone"))) return;
+  const { assertSystemAdminPhoneAvailable } = require("../utils/phoneIdentity");
+  await assertSystemAdminPhoneAvailable(this.phone, { excludeSystemUserId: this._id });
+});
+
 module.exports =
   mongoose.models.SystemUser ||
   mongoose.model("SystemUser", systemUserSchema);

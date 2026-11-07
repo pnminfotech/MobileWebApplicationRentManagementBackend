@@ -23,6 +23,7 @@ const uploadRoutes = require("./routes/uploadRoutes");
 const formWithDocsRoutes = require("./routes/formWithDocs");
 const documentRoutes = require("./routes/documentRoutes");
 const tenantRoutes = require("./routes/tenant");
+const tenantAttendanceRoutes = require("./routes/tenantAttendance");
 const paymentRoutes = require("./routes/payments");
 const leaveRoutes = require("./routes/leaveRoutes");
 const adminNotificationsRouter = require("./routes/adminattendenceNotifications");
@@ -116,6 +117,15 @@ app.get("/api/health", (_req, res) =>
 );
 
 // Routes
+// Mount tenant routes before the generic /api routers. formRoutes installs an
+// admin auth guard for every unmatched path, which otherwise intercepts public
+// tenant OTP requests (and tenant-authenticated dashboard requests) first.
+app.use("/api/tenant", tenantRoutes);
+// Mount tenant leave endpoints before generic /api routers that install an
+// admin-auth fallback for routes they do not recognize.
+app.use("/api/tenant/leaves", leaveRoutes);
+app.use("/api", tenantAttendanceRoutes);
+app.use("/api/police-verification", require("./routes/policeVerification"));
 app.use("/api", require("./routes/notifications"));
 app.use("/api/uploads", uploadRoutes);
 app.use("/api", formRoutes);
@@ -129,17 +139,13 @@ app.use("/api/commercial-units", commercialRoutes);
 app.use("/api/light-bill", lightBillRoutes);
 app.use("/api/other-expense", otherExpenseRoutes);
 app.use("/api/documents", documentRoutes);
-app.use("/api/tenant", tenantRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api", require("./routes/invoices"));
 app.use("/api/invites", invitesRouter);
-app.use("/api/tenant/leaves", leaveRoutes);
-
 app.use("/api/staff-expenses", require("./routes/staffExpenseRoutes"));
 app.use("/api/canteen-attendance", require("./routes/canteenAttendanceRoutes"));
 app.use("/api/audit-logs", auditLogRoutes);
 app.use("/api/admin", adminLeaveRoutes);
-app.use("/api", require("./routes/tenantAttendance"));
 app.use("/api/admin", adminNotificationsRouter);
 
 const PORT = process.env.PORT || 8000;

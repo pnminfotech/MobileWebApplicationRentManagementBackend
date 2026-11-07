@@ -207,8 +207,8 @@ router.post("/forms/quick-add", async (req, res) => {
     console.error("Quick add tenant error:", error);
     const isValidation = error?.name === "ValidationError" || error?.name === "CastError";
     const isDuplicate = error?.code === 11000;
-    return res.status(isDuplicate ? 409 : isValidation ? 400 : 500).json({
-      message: "Could not save tenant details.",
+    return res.status(error?.http || (isDuplicate ? 409 : isValidation ? 400 : 500)).json({
+      message: error?.http === 409 ? error.message : "Could not save tenant details.",
       error: error.message,
     });
   }
@@ -424,7 +424,7 @@ router.post("/forms/import", async (req, res) => {
     });
   } catch (error) {
     console.error("Tenant import failed:", error);
-    return res.status(500).json({ message: "Unable to import tenants", error: error.message });
+    return res.status(error?.http || 500).json({ message: error?.http === 409 ? error.message : "Unable to import tenants", error: error.message });
   }
 });
 

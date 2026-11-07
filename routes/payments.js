@@ -199,20 +199,79 @@ const existing = (tenant.rents || []).find((r) => {
   return false;
 });
 
+const approvedAmount = Number(pay.amount);
+if (!Number.isFinite(approvedAmount) || approvedAmount <= 0) {
+  return res.status(400).json({ message: "Reported payment amount is invalid" });
+}
+const paymentDate = pay.at || pay.createdAt || new Date();
+rentPayload.date = paymentDate;
+const approvedRentPayment = {
+  amount: approvedAmount,
+  rentAmount: approvedAmount,
+  canteenAmount: 0,
+  lightBillAmount: 0,
+  extraAmount: 0,
+  date: paymentDate,
+  paymentMode: rentPayload.paymentMode,
+  utr: rentPayload.utr,
+  note: rentPayload.note,
+  receiptUrl: "",
+};
+
 if (existing) {
   existing.month = monthKey; // normalize
-  existing.rentAmount = rentPayload.rentAmount;
-  existing.date = rentPayload.date;
+  if (!Array.isArray(existing.payments)) existing.payments = [];
+  if (existing.payments.length === 0 && Number(existing.rentAmount || 0) > 0) {
+    existing.payments.push({
+      amount: Number(existing.totalAmount || existing.rentAmount || 0),
+      rentAmount: Number(existing.rentAmount || 0),
+      discountAmount: Number(existing.discountAmount || 0),
+      canteenAmount: Number(existing.canteenAmount || 0),
+      lightBillAmount: Number(existing.lightBillAmount || 0),
+      extraAmount: 0,
+      date: existing.date || rentDate,
+      paymentMode: existing.paymentMode || "Cash",
+      utr: existing.utr || "",
+      note: existing.note || "",
+      receiptUrl: existing.receiptUrl || "",
+    });
+  }
+  existing.payments.push(approvedRentPayment);
+  existing.rentAmount = existing.payments.reduce(
+    (sum, payment) => sum + Number(payment.rentAmount ?? payment.amount ?? 0),
+    0
+  );
+  existing.canteenAmount = existing.payments.reduce(
+    (sum, payment) => sum + Number(payment.canteenAmount || 0),
+    0
+  );
+  existing.lightBillAmount = existing.payments.reduce(
+    (sum, payment) => sum + Number(payment.lightBillAmount || 0),
+    0
+  );
+  existing.totalAmount = existing.payments.reduce(
+    (sum, payment) => sum + Number(payment.amount || 0),
+    0
+  );
+  existing.date = paymentDate;
   existing.paymentMode = rentPayload.paymentMode;
   existing.utr = rentPayload.utr;
   existing.note = rentPayload.note;
 } else {
-  tenant.rents = [...(tenant.rents || []), rentPayload];
+  tenant.rents = [...(tenant.rents || []), {
+    ...rentPayload,
+    rentAmount: approvedAmount,
+    totalAmount: approvedAmount,
+    payments: [approvedRentPayment],
+  }];
 }
+tenant.markModified("rents");
 await tenant.save();
 
 // Flip payment + notification
 pay.status = "confirmed";
+pay.reviewedAt = new Date();
+pay.reviewMessage = `Your payment report for ${monthKey} was approved.`;
 await pay.save();
 
     notif.status = "approved";
@@ -257,6 +316,11 @@ router.post("/reject/:id", authAdmin, async (req, res) => {
     }
 
     pay.status = "rejected";
+    pay.reviewedAt = new Date();
+    const rejectedMonth = pay.month && pay.year
+      ? monthToFirstDate(pay.year, pay.month).toLocaleString("en-IN", { month: "long", year: "numeric" })
+      : "the selected month";
+    pay.reviewMessage = `Your payment report for ${rejectedMonth} was rejected. Please review the amount, month, and UTR, then submit the payment report again.`;
     await pay.save();
 
     notif.status = "rejected";

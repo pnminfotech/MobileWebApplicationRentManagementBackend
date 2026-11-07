@@ -66,6 +66,7 @@ const {
   sendSuperadminEmailChangedNotice,
 } = require("../services/emailService");
 const { sendBusinessLoginOtp } = require("../services/smsService");
+const { findTenantPhoneMatches } = require("../utils/phoneIdentity");
 const {
   notifyOrganization,
   notifySuperadmins,
@@ -861,6 +862,10 @@ router.post("/auth/login/request-phone-code", phoneLoginRequestIpLimit, phoneLog
   try {
     const phone = normalizeBusinessPhone(req.body?.phone);
     if (!phone) return res.status(400).json({ message: "Enter a valid 10-digit mobile number." });
+    const tenantMatches = await findTenantPhoneMatches(phone);
+    if (tenantMatches.length) {
+      return res.status(409).json({ message: "This mobile number is registered to a tenant and cannot be used for a system admin account." });
+    }
     if (!passRateLimits(req, res, [loginCodeSendIpLimit])) return;
 
     const matchingUsers = await findUsersByPhone(phone);
@@ -988,6 +993,11 @@ router.post("/auth/login/verify-phone-code", phoneLoginVerifyIpLimit, phoneLogin
     );
     if (!consumed) return res.status(400).json({ message: "Sign-in request expired. Please start again." });
 
+    const tenantMatches = await findTenantPhoneMatches(consumed.phone);
+    if (tenantMatches.length) {
+      return res.status(409).json({ message: "This mobile number is registered to a tenant and cannot be used for a system admin account." });
+    }
+
     const matchingUsers = await findUsersByPhone(consumed.phone);
     if (matchingUsers.some((user) => user.role === "superadmin")) {
       return res.status(403).json({ message: "Use the superadmin email sign-in option." });
@@ -1022,6 +1032,9 @@ router.post("/auth/login/verify-phone-code", phoneLoginVerifyIpLimit, phoneLogin
       organization,
     });
   } catch (error) {
+    if (error?.http === 409 || error?.code === "PHONE_IDENTITY_CONFLICT") {
+      return res.status(409).json({ message: error.message });
+    }
     if (error?.code === 11000) {
       return res.status(409).json({ message: "This mobile number already has an account. Please request a fresh OTP." });
     }
@@ -2768,6 +2781,69 @@ router.delete(
       res.json({ message: affectedCount ? "Occupied unit removed. Tenant history was kept and the subscription count was updated." : "Vacant unit removed and subscription count updated", units: newUnits, removed, effectiveDate });
     } catch (err) {
       res.status(500).json({ message: "Unable to remove unit", error: err.message });
+    }
+  }
+);
+
+router.patch(
+  "/admin/organizations/:id/trial-period",
+  requireSystemAuth,
+  requireRole("superadmin"),
+  async (req, res) => {
+    try {
+      if (!(await verifySuperadminSecurityPin(req, res))) return;
+
+      const dateValue = String(req.body?.endDate || "");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateValue)) {
+        return res.status(400).json({ message: "Choose a valid trial end date." });
+      }
+      const endDate = new Date(`${dateValue}T23:59:59.999Z`);
+      if (Number.isNaN(endDate.getTime()) || endDate.toISOString().slice(0, 10) !== dateValue) {
+        return res.status(400).json({ message: "Choose a valid trial end date." });
+      }
+
+      const organization = await Organization.findById(req.params.id);
+      if (!organization) return res.status(404).json({ message: "Organization not found." });
+
+      const subscription = await Subscription.findOne({ organizationId: organization._id }).sort({ createdAt: -1 });
+      if (!subscription || Number(subscription.amount || 0) !== 0 || subscription.planId) {
+        return res.status(409).json({ message: "Only trial subscriptions can have their trial period changed." });
+      }
+
+      const previousEndDate = subscription.endDate;
+      const expired = isPastDate(endDate);
+      subscription.endDate = endDate;
+      subscription.status = expired ? "expired" : "active";
+      await subscription.save();
+
+      if (!['suspended', 'cancelled'].includes(organization.status)) {
+        organization.status = expired ? "expired" : "active";
+        await organization.save();
+        await SystemUser.updateMany(
+          { organizationId: organization._id, status: expired ? "active" : "pending_payment" },
+          { $set: { status: expired ? "pending_payment" : "active" } }
+        );
+      }
+
+      await AuditLog.create({
+        organizationId: organization._id,
+        entityType: "subscription",
+        entityId: subscription._id,
+        action: "update",
+        actorId: String(req.systemUser._id),
+        actorName: req.systemUser.name || "Superadmin",
+        actorEmail: req.systemUser.email || "",
+        actorRole: "superadmin",
+        reason: "Superadmin changed the trial end date",
+        before: { endDate: previousEndDate },
+        after: { endDate },
+        changes: { endDate: { from: previousEndDate, to: endDate } },
+      });
+
+      return res.json({ message: `Trial period updated through ${dateValue}.`, organizationId: organization._id, endDate, status: organization.status });
+    } catch (err) {
+      console.error("superadmin trial period update error:", err);
+      return res.status(500).json({ message: "Unable to update trial period." });
     }
   }
 );

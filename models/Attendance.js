@@ -19,6 +19,9 @@ const schema = new mongoose.Schema({
   dateKey: { type: String, required: true, index: true }, // "YYYY-MM-DD"
 
   status: { type: String, enum: ["pending", "checked_in", "checked_out"], default: "pending" },
+  approvalStatus: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
+  approvalNote: { type: String, default: "" },
+  reviewedAt: Date,
 
   isLate: { type: Boolean, default: false },
   lateReason: String,
